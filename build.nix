@@ -49,7 +49,6 @@ let
   ];
 
   resourcesAttr = {
-    "kli/cairn/maxims" = ./src/maxims;
     "kli/cairn/prompts" = ./src/prompts;
   };
 

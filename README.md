@@ -71,7 +71,15 @@ programs.kli = {
 };
 ```
 
-Imperatively, install it from a running kli with `/install <url> <git-tree-sha1>`. kli resolves a published build at that url, pins it to the tree hash, shows you what it is about to load, and adds it with no rebuild. The companion commands manage what you have. `/extensions` lists them, `/enable` and `/disable` toggle one, and `/uninstall` removes a runtime-installed extension. Anything baked in through Nix stays put until you edit your configuration and rebuild. To load a local build for a single run, start kli with `kli --extension <path>`.
+Imperatively, install a published release with the `kli install` subcommand. Every [release page](https://github.com/kleisli-io/cairn/releases) carries the exact command for that version; for v0.1.0:
+
+```sh
+kli install https://github.com/kleisli-io/cairn/releases/download/v0.1.0/cairn.bundle f97b592316027ef9c8c56d2072a75b6b596a0172
+```
+
+The second argument is the release's git-tree-sha1 pin: kli recomputes it over the fetched tree and refuses to install on a mismatch. It shows what it is about to add and asks before going ahead; pass `--yes` for scripts and other non-interactive use. To additionally require the release signature, add the Kleisli.IO release key — committed at [`release/trust/cairn-release.pub`](https://github.com/kleisli-io/cairn/blob/main/release/trust/cairn-release.pub) — to `trustRoots` in your kli `settings.json`; kli then fetches `cairn.bundle.sig` next to the artifact and installs only if the signature verifies.
+
+The same install works from inside a running session as `/install <url> <git-tree-sha1>`, and the companion commands manage what you have: `/extensions` lists them, `/enable` and `/disable` toggle one, and `/uninstall` removes a runtime-installed extension. Anything baked in through Nix stays put until you edit your configuration and rebuild. To load a local build for a single run, start kli with `kli --extension <path>`.
 
 Run `kli` in a project directory, and that working directory selects the project whose task graph cairn opens.
 
