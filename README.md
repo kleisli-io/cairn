@@ -194,7 +194,6 @@ Across `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`:
 
 - **Documentation:** [docs.kleisli.io/cairn](https://docs.kleisli.io/cairn) covers every tool, the full TQ grammar, the edge model, and the working method.
 - **Release notes:** [`CHANGELOG.md`](CHANGELOG.md).
-- **License:** [MIT](LICENSE).
 
 ## License
 

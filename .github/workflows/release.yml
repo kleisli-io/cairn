@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# Draft-then-promote flow for a library release (no binary artifacts; the
+# sealed release points at the tagged source):
+#   draft    creates a draft release with the CHANGELOG section as notes
+#   verify   builds the library and runs its check suite from the tag
+#   promote  flips draft=false. Only a non-draft release is sealed.
+#
+# A failure anywhere before `promote` succeeds leaves a *draft* release.
+
+jobs:
+  draft:
+    name: Create draft release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          # Pull this version's section out of CHANGELOG.md — the block between its
+          # "## [x.y.z]" header and the next version header. Falls back to a bare
+          # title so a tag with no changelog entry still drafts.
+          awk "/^## \\[?$VERSION/{f=1;next} /^## \\[?[0-9]/{if(f)exit} f" CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "Release $TAG" > notes.md
+          fi
+
+      - name: Create or refresh draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --json isDraft --jq .isDraft >/tmp/state 2>/dev/null; then
+            if [ "$(cat /tmp/state)" = "false" ]; then
+              echo "Refusing: $TAG is already published (sealed)."
+              exit 1
+            fi
+            echo "Refreshing existing draft for $TAG"
+            gh release edit "$TAG" --draft --title "$TAG" --notes-file notes.md
+          else
+            echo "Creating draft for $TAG"
+            gh release create "$TAG" --draft --title "$TAG" --notes-file notes.md
+          fi
+
+  verify:
+    name: Build library and run checks
+    needs: draft
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build library, tests, and drift gate
+        run: nix build ".#checks.x86_64-linux.library" ".#checks.x86_64-linux.tests" ".#checks.x86_64-linux.drift" --no-link
+
+  promote:
+    name: Promote draft to published
+    needs: [draft, verify]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Flip draft to published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release edit "$TAG" --draft=false
