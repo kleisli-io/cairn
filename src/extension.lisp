@@ -14,24 +14,27 @@
 stash the handle, its guard mutex, and the project id on PROTOCOL. Returns the
 prior handle for symmetric restore."
   (declare (ignore contribution))
-  (multiple-value-bind (path step) (resolve-cairn-db-location context)
-    (let ((previous (protocol-storage protocol +cairn-db-key+)))
-      (ensure-directories-exist path)
-      (when (eq step :project)
-        (ensure-db-gitignore path)
-        (ensure-log-gitattributes path))
-      (let ((handle (open-cairn-store path))
-            (project (resolve-project context)))
-        (when (eq step :project) (reconcile-store handle))
-        (ensure-project-row handle project)
-        (setf (protocol-storage protocol +cairn-db-key+) handle
-              (protocol-storage protocol +cairn-lock-key+)
-              (sb-thread:make-mutex :name "cairn-store")
-              (protocol-storage protocol +cairn-project-key+) (cp-project-id project))
-        (let ((store (find-cairn-store context)))
-          (when store
-            (setf (cairn-store-path store) path))))
-      previous)))
+  (let ((previous (protocol-storage protocol +cairn-db-key+)))
+    (if *image-dump-in-progress*
+        previous
+        (multiple-value-bind (path step) (resolve-cairn-db-location context)
+          (ensure-directories-exist path)
+          (when (eq step :project)
+            (ensure-db-gitignore path)
+            (ensure-log-gitattributes path))
+          (let ((handle (open-cairn-store path))
+                (project (resolve-project context)))
+            (when (eq step :project) (reconcile-store handle))
+            (ensure-project-row handle project)
+            (setf (protocol-storage protocol +cairn-db-key+) handle
+                  (protocol-storage protocol +cairn-lock-key+)
+                  (or (protocol-storage protocol +cairn-lock-key+)
+                      (sb-thread:make-mutex :name "cairn-store"))
+                  (protocol-storage protocol +cairn-project-key+) (cp-project-id project))
+            (let ((store (find-cairn-store context)))
+              (when store
+                (setf (cairn-store-path store) path))))
+          previous))))
 
 (defun cairn-close-db (protocol contribution context)
   "Close the database handle and drop it, its mutex, and the project id from
@@ -118,8 +121,8 @@ PROTOCOL's storage."
      :runner #'run-handoff
      :metadata '(:capabilities (:cairn/write)))
    (tool task_search
-     :label "Search tasks"
-     :description "Full-text ranked search over observations. Returns matching tasks with a snippet."
+     :label "Search observation text"
+     :description "Full-text/BM25 search over observation bodies only. This does NOT search task names, slugs, status, metadata, or graph structure; use task_query/TQ for task lookup by identity/name/slug/status/metadata. Returns matching tasks because observations belong to tasks, with a snippet from the observation corpus."
      :parameters '(:object (:query :string)
                    (:limit :integer :optional t)
                    (:task_id :string :optional t))
@@ -133,14 +136,18 @@ PROTOCOL's storage."
      :metadata '(:capabilities (:cairn/read)))
    (tool timeline
      :label "Timeline"
-     :description "Recent events for a task, most recent first."
+     :description "Recent events for a task, most recent first. Filter with types (comma-separated event types, validated against the live vocabulary); window or page with before_seq (exclusive upper bound / page-back cursor) and after_seq (exclusive lower bound); limit caps the count (default 20). Set full=true to render each event verbatim — a header line plus the untruncated multi-line body — instead of a one-line digest."
      :parameters '(:object (:task_id :string :optional t)
+                   (:types :string :optional t)
+                   (:full :boolean :optional t)
+                   (:before_seq :integer :optional t)
+                   (:after_seq :integer :optional t)
                    (:limit :integer :optional t))
      :runner #'run-timeline
      :metadata '(:capabilities (:cairn/read)))
    (tool task_query
-     :label "Query tasks"
-     :description "Run a read-only query over the task graph and return text. The query argument is a single s-expression in cairn's query language (TQ); it is a Lisp form, not a bare word, so names and probes are always wrapped in parens. Pass a reflective form on its own to learn the language: (views) lists the named views, (schema) the sources and steps, (fields) the queryable fields, (edges) the edge types. To run a named view, wrap its name as (query \"plan\") or (query \"plan-frontier\") — passing bare plan or views is a parse error. Otherwise a query is a SOURCE optionally threaded through STEPS with ->, for example (-> (current) (:follow :phase-of) (:ids)) or (-> (active) (:where (> :obs-count 10)) (:count)); transformer steps compose (node-set to node-set) and shaper steps terminate into a value. Every form yields a value or a structured error, never a crash or a silent no-op. The !-forms (mutations and define!) are refused here; use task_query_write."
+     :label "Query task graph"
+     :description "Run a read-only query over the task graph/projection and return text. Use this for task identity/name/slug/status/metadata lookup and graph relationships; for example, find tasks by slug with (-> (all) (:where (matches :slug \"compaction\")) (:select :slug :status)). Do not use task_search for task-name or slug lookup: task_search searches observation text only. The query argument is a single s-expression in cairn's query language (TQ); it is a Lisp form, not a bare word, so names and probes are always wrapped in parens. Pass a reflective form on its own to learn the language: (schema) lists the sources, steps, predicates, and write forms, with steps and predicates carrying their kinds and signatures — call it first; (views) lists the named views, (fields) the queryable fields, (edges) the edge types. These reflective forms are SOURCES that list names, not steps — to project fields onto results use the :select step (its field names come from (fields)). An unknown field, predicate, step, source, or edge errors with a nearest-match suggestion, never a silent miss. Timestamps (created-ts, updated-ts, status-ts) are universal-time, so a calendar intent is one predicate — (on :updated-ts \"2026-06-24\"), (since ...), (before ...) — and an integer operand to a numeric comparison against a timestamp is read as Unix seconds. To run a named view, wrap its name as (query \"plan\") or (query \"plan-frontier\") — passing bare plan or views is a query error, since a bare word is not a source form. Otherwise a query is a SOURCE optionally threaded through STEPS with ->, for example (-> (current) (:follow :phase-of) (:ids)), (-> (current) (:follow :phase-of) (:select :slug :status)), or (-> (active) (:where (> :obs-count 10)) (:count)); transformer steps compose (node-set to node-set) and shaper steps terminate into a value. Every form yields a value or a structured error, never a crash or a silent no-op. The !-forms (mutations and view definitions) are refused here; use task_query_write."
      :parameters '(:object (:query :string))
      :runner #'run-task-query
      :metadata '(:capabilities (:cairn/read)))
@@ -152,7 +159,7 @@ PROTOCOL's storage."
      :metadata '(:capabilities (:cairn/write)))
    (tool task_bootstrap
      :label "Bootstrap task"
-     :description "Orient on a task in one call: its state, neighbors, open handoffs, recent observations, and what other sessions are currently doing. Adopts the task as current only when none is set."
+     :description "Orient on a task in one call: its state, neighbors, open handoffs, and recent observations. An explicit task_id switches the current pointer to that task; with no task_id, orients on the current task and adopts it only when none is set."
      :parameters '(:object (:task_id :string :optional t))
      :runner #'run-task-bootstrap
      :metadata '(:capabilities (:cairn/read)))
@@ -167,5 +174,4 @@ PROTOCOL's storage."
      #'uninstall-cairn-compaction)))
 
 (register-extension-resource-roots :cairn
-                                   :prompts "kli/cairn/prompts"
-                                   :skills "kli/cairn/skills")
+                                   :prompts "kli/cairn/prompts")

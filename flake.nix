@@ -5,12 +5,12 @@
     nixpkgs.url = "github:NixOS/nixpkgs/88d3861acdd3d2f0e361767018218e51810df8a1";
     cl-deps.url = "github:kleisli-io/cl-deps";
     cl-deps.inputs.nixpkgs.follows = "nixpkgs";
-    kli-new.url = "git+ssh://git@github.com/kleisli-io/kli-new.git";
-    kli-new.inputs.nixpkgs.follows = "nixpkgs";
-    kli-new.inputs.cl-deps.follows = "cl-deps";
+    kli.url = "github:kleisli-io/kli";
+    kli.inputs.nixpkgs.follows = "nixpkgs";
+    kli.inputs.cl-deps.follows = "cl-deps";
   };
 
-  outputs = { self, nixpkgs, cl-deps, kli-new, ... }:
+  outputs = { self, nixpkgs, cl-deps, kli, ... }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
         "x86_64-linux"
@@ -22,10 +22,11 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           inherit (cl-deps.lib.${system}) buildLisp lisp;
-          kli = kli-new.checks.${system}.library;
+          kliLib = kli.checks.${system}.library;
         in
         import ./build.nix {
-          inherit pkgs buildLisp lisp kli;
+          inherit pkgs buildLisp lisp;
+          kli = kliLib;
         };
     in
     {

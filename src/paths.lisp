@@ -158,16 +158,18 @@ nearest project root; else the reserved scratch id."
               (make-cairn-project))))))
 
 (defun ensure-db-gitignore (db-path)
-  "Ensure the project-local store directory ignores the binary database files
-while keeping the committable markdown scratchpad tracked. Idempotent."
+  "Ensure the project-local store directory ignores the binary database files and
+the runtime epoch marker, while keeping the committable markdown scratchpad and
+its event logs tracked. Idempotent."
   (let* ((dir (uiop:pathname-directory-pathname db-path))
          (ignore (merge-pathnames ".gitignore" dir))
-         (entry "cairn.db*"))
-    (unless (and (uiop:file-exists-p ignore)
-                 (member entry (uiop:read-file-lines ignore) :test #'string=))
+         (present (and (uiop:file-exists-p ignore) (uiop:read-file-lines ignore)))
+         (missing (remove-if (lambda (e) (member e present :test #'string=))
+                             '("cairn.db*" "tasks/.epoch"))))
+    (when missing
       (with-open-file (out ignore :direction :output
                                   :if-exists :append :if-does-not-exist :create)
-        (write-line entry out)))))
+        (dolist (entry missing) (write-line entry out))))))
 
 (defun ensure-log-gitattributes (db-path)
   "Ensure the store directory union-merges the per-task event logs, so appends
@@ -206,6 +208,12 @@ Idempotent."
 of the on-disk layout, shared by the resolved path and the write-path mirror."
   (merge-pathnames (concatenate 'string "tasks/" slug "/events.ndjson")
                    (uiop:ensure-directory-pathname base-dir)))
+
+(defun cairn-epoch-under (base-dir)
+  "The shared epoch marker under BASE-DIR: tasks/.epoch, beside the per-task log
+directories. One counter every writer bumps and every reader consults, so a live
+store learns in O(1) whether any log moved since it last swept."
+  (merge-pathnames "tasks/.epoch" (uiop:ensure-directory-pathname base-dir)))
 
 (defun cairn-task-log-path (slug &optional context)
   "SLUG's append-only event log: tasks/<slug>/events.ndjson beside the database."

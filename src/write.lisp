@@ -360,9 +360,64 @@ NIL while replaying the log into the cache, so an ingested line is not re-append
   (let ((file (third (first (sqlite:execute-to-list db "PRAGMA database_list")))))
     (and (stringp file) (plusp (length file)) file)))
 
+;;; Advisory whole-file locking for the per-task logs. The append opens with
+;;; O_APPEND, so every write(2) lands atomically at EOF and a line can never be
+;;; lost; the lock exists only to stop a line that flushes as several write(2)s
+;;; from interleaving with a concurrent writer's. sb-posix carries no flock, so
+;;; we bind flock(2) directly. Locking is layered above the write, never a gate
+;;; before it: a kernel that refuses the lock (EPERM under seccomp, ENOSYS,
+;;; ENOLCK) leaves the append to proceed unlocked rather than drop it.
+(sb-alien:define-alien-routine ("flock" %flock) sb-alien:int
+  (fd sb-alien:int) (operation sb-alien:int))
+
+(defconstant +lock-sh+ 1 "flock shared (reader) lock.")
+(defconstant +lock-ex+ 2 "flock exclusive (writer) lock.")
+(defconstant +lock-un+ 8 "flock release.")
+
+(defun %flock-fd (fd operation)
+  "Apply flock OPERATION to FD, retrying across EINTR. Returns T on success, NIL
+when the kernel refuses advisory locking."
+  (loop
+    (when (zerop (%flock fd operation)) (return t))
+    (unless (= (sb-alien:get-errno) sb-unix:eintr) (return nil))))
+
+(defmacro with-file-lock ((stream operation) &body body)
+  "Hold flock OPERATION (+lock-sh+ / +lock-ex+) on STREAM's fd across BODY,
+releasing on exit. Flush any output inside BODY so the write(2)s land before the
+lock lifts."
+  (let ((fd (gensym "FD")))
+    `(let ((,fd (sb-sys:fd-stream-fd ,stream)))
+       (%flock-fd ,fd ,operation)
+       (unwind-protect (progn ,@body)
+         (%flock-fd ,fd +lock-un+)))))
+
+(defun %bump-epoch (db)
+  "Advance the epoch marker beside the store: a monotonic counter every writer
+increments under an exclusive lock. A reader compares the counter to decide, in
+O(1), whether any log moved since it last swept — the coarse wake-up behind a
+live store's per-call refresh. Best-effort like the append: a refused lock still
+advances the count. A no-op when the store has no backing file."
+  (let ((file (%store-file db)))
+    (when file
+      (let ((path (cairn-epoch-under (uiop:pathname-directory-pathname file))))
+        (ensure-directories-exist path)
+        (with-open-file (out path :direction :io
+                                  :if-exists :overwrite :if-does-not-exist :create
+                                  :external-format :utf-8)
+          (with-file-lock (out +lock-ex+)
+            ;; The counter only ever grows, so its text is never shorter than what
+            ;; it overwrites — no truncation, no stale trailing digits.
+            (let ((n (or (ignore-errors
+                          (parse-integer (read-line out nil "") :junk-allowed t))
+                         0)))
+              (file-position out 0)
+              (write-string (princ-to-string (1+ n)) out)
+              (finish-output out))))))))
+
 (defun %append-to-log (db slug line)
   "Append LINE to SLUG's event log beside the store file, creating the task
-directory on first write. A no-op when the store has no backing file."
+directory on first write, then bump the shared epoch. A no-op when the store has
+no backing file."
   (let ((file (%store-file db)))
     (when file
       (let ((path (cairn-task-log-under (uiop:pathname-directory-pathname file) slug)))
@@ -370,8 +425,11 @@ directory on first write. A no-op when the store has no backing file."
         (with-open-file (out path :direction :output
                                   :if-exists :append :if-does-not-exist :create
                                   :external-format :utf-8)
-          (write-string line out)
-          (write-char #\Newline out))))))
+          (with-file-lock (out +lock-ex+)
+            (write-string line out)
+            (write-char #\Newline out)
+            (finish-output out)))
+        (%bump-epoch db)))))
 
 (defun record-event (db task-slug type payload
                      &key session prev-session raw-ts event-id legacy-id source-seq

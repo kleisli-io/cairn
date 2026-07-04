@@ -21,7 +21,9 @@
                 #:contribution-state
                 #:tool-result-content
                 #:tool-result-details
-                #:tool-result-error-p)
+                #:tool-result-error-p
+                #:extension-loaded-p
+                #:*image-dump-in-progress*)
   (:import-from #:kli/agent/session
                 #:session-mode-bindings
                 #:mode-binding-session-binding
@@ -29,17 +31,10 @@
                 #:session-context-transform-policy
                 #:recode-context-transform-policy
                 #:session-compaction-policy
-                #:recode-compaction-policy
-                #:follow-up-agent-session
-                #:agent-session-context
-                #:agent-session-busy-p)
+                #:recode-compaction-policy)
   (:import-from #:kli/session/log
-                #:make-user-message
+                #:make-harness-context-message
                 #:message-timestamp)
-  (:import-from #:kli/context/lens
-                #:stage-context-patch
-                #:commit-context-patches
-                #:make-append-message-patch)
   (:import-from #:kli/interaction/commands
                 #:make-command
                 #:make-command-result

@@ -28,12 +28,12 @@ pointer is set."
       (let ((result (ext:invoke-tool protocol :task_bootstrap (list :task_id slug) context)))
         (is (not (ext:tool-result-error-p result)))
         (is (string= slug (cairn:current-task-id context)) "adopted as the current task")
-        (is (search slug (tool-text result)) "the readout names the task")
-        (is (search "swarm" (tool-text result)) "the readout carries a swarm section")))))
+        (is (search slug (tool-text result)) "the readout names the task")))))
 
-(test bootstrap-does-not-override-an-existing-pointer
-  "When a current task is already set, bootstrapping another task reads it without
-moving the pointer."
+(test bootstrap-with-explicit-task-id-switches-the-pointer
+  "An explicit task_id focuses that task: bootstrapping it makes it current even
+when another task is already current. A subsequent no-arg bootstrap orients on the
+now-current task and leaves the pointer alone."
   (with-cairn-protocol (context protocol)
     (ext:invoke-tool protocol :task_create (list :name "the first current task") context)
     (let ((current (cairn:current-task-id context))
@@ -43,29 +43,33 @@ moving the pointer."
       (is (string= current (cairn:current-task-id context)) "the second create did not adopt")
       (let ((result (ext:invoke-tool protocol :task_bootstrap (list :task_id other) context)))
         (is (search other (tool-text result)) "the readout names the bootstrapped task")
-        (is (string= current (cairn:current-task-id context))
-            "the human-set pointer is left alone")))))
+        (is (string= other (cairn:current-task-id context))
+            "an explicit task_id switches the pointer"))
+      (let ((result (ext:invoke-tool protocol :task_bootstrap '() context)))
+        (is (search other (tool-text result)) "a no-arg bootstrap orients on the current task")
+        (is (string= other (cairn:current-task-id context))
+            "a no-arg bootstrap leaves the pointer alone")))))
 
-(test bootstrap-swarm-shows-other-sessions-and-flags-the-shared-task
-  "The swarm readout names other sessions' latest activity and flags those last
-active on the bootstrapped task."
+(test bootstrap-includes-the-earlier-observations-pointer
+  "task_bootstrap inherits the capped-observations pointer through %task-get-text:
+past the shown five it names N earlier, full=true, and types=observation."
   (with-cairn-protocol (context protocol)
-    (ext:invoke-tool protocol :task_create (list :name "the swarm focus task") context)
-    (let ((slug (cairn:current-task-id context))
-          (db (task-db protocol)))
-      (cairn:record-event db slug "observation"
-                          (list :text "peer note on the shared task")
-                          :session "SESSIONPEER01")
-      (cairn:record-event db "2026-06-18-a-different-peer-task" "observation"
-                          (list :text "peer note elsewhere")
-                          :session "SESSIONFARAWAY")
-      (let ((text (tool-text (ext:invoke-tool protocol :task_bootstrap '() context))))
-        (is (search "SESSIONP" text) "names the peer on the shared task")
-        (is (search "also on this task" text) "flags the concurrent session")
-        (is (search "SESSIONF" text) "names the session working elsewhere")))))
+    (ext:invoke-tool protocol :task_create (list :name "the bootstrap cap task") context)
+    (dotimes (i 8)
+      (ext:invoke-tool protocol :observe (list :text (format nil "boot note ~D" i)) context))
+    (let ((out (tool-text (ext:invoke-tool protocol :task_bootstrap '() context))))
+      (is (search "3 earlier observation" out) "bootstrap shows the pointer with the right N")
+      (is (search "full=true" out) "the pointer names the full flag")
+      (is (search "types=observation" out) "the pointer names the observation type"))))
 
 (test bootstrap-errors-on-an-unknown-task
+  "An unknown task_id fails and leaves the current pointer untouched -- the switch
+happens only once the task is found."
   (with-cairn-protocol (context protocol)
-    (is (ext:tool-result-error-p
-         (ext:invoke-tool protocol :task_bootstrap
-                          (list :task_id "2026-01-01-no-such-task-anywhere") context)))))
+    (ext:invoke-tool protocol :task_create (list :name "the standing current task") context)
+    (let ((current (cairn:current-task-id context)))
+      (is (ext:tool-result-error-p
+           (ext:invoke-tool protocol :task_bootstrap
+                            (list :task_id "2026-01-01-no-such-task-anywhere") context)))
+      (is (string= current (cairn:current-task-id context))
+          "a failed bootstrap does not move the pointer"))))

@@ -1,50 +1,91 @@
 ---
-description: Compose and record a resumable handoff for the current task
-argument-hint: "<optional guidance, or empty>"
+description: Handoff current task state so a later session can resume from live cairn truth plus a written note
+argument-hint: "<next-session focus, or empty>"
 ---
 # Handoff
 
-A handoff lets another session resume cleanly. Be thorough yet concise: compact
-the context without losing the load-bearing details. Prefer file:line references
-over long code blocks.
+Write a resumable handoff for the current task. The `handoff` tool's summary is
+the load-bearing field; the markdown note is the richer map.
 
-Guidance: $ARGUMENTS
+Next session focus: $ARGUMENTS
 
-## Scaffold, then enrich (cairn affordances)
-- First compose a concise one-line summary of where things stand — this is the
-  field a resuming session reads first.
-- handoff(summary=<one line>) — scaffolds the document, returns its path, and
-  records the handoff event. Requires a current task; if none is set, run
-  task_bootstrap or task_create first.
-- Read the scaffolded file, THEN overwrite it with the rich handoff below (reading
-  first avoids colliding with the scaffold).
-- task_get / timeline(task_id?, limit?) / task_search(query) — pull the state,
-  recent events, and related findings the handoff should capture.
-- task_query (query "plan") / (query "plan-frontier") — if the task is phased,
-  record the current phase and what remains.
+## Process
 
-## Structure
-Frontmatter: date, git_branch, git_commit, repository, task, type: handoff,
-status: active.
+### Orient from the live stream
+- Ensure a current task exists: use `task_bootstrap` or `task_create` if needed.
+- Pull `task_get`, `timeline(limit=...)`, and relevant `task_search` results.
+- If phased, run `task_query (query "plan")` and `task_query (query "plan-frontier")`.
+- Check modified artifacts directly so file references are current.
 
-  # Handoff: <task> — <brief description>
+Done when the current task, recent events, relevant observations, phase state,
+and changed paths are all accounted for.
 
-  ## Task(s) — the work and the status of each item; if phased, call out the
-  current phase.
-  ## Critical References — the 2-3 must-read paths for the next session.
-  ## Recent Changes — what changed, in file:line form.
-  ## Learnings — what was discovered, each with file:line evidence.
-  ## Artifacts — everything produced or updated, as paths or file:line references.
-  ## Task Graph State — for a phased task: current, completed, and pending phases
-  plus related tasks, from task_query (query "plan").
-  ## Action Items & Next Steps — a numbered list of what to do next.
-  ## Other Notes — anything else worth carrying over.
+### Scaffold, then enrich
+- Compose one concise summary stating where the work stands and the next move.
+- Call `handoff(summary=<one line>)` before writing the note; it records the
+  event and returns the path under `.kli/tasks/<task-id>/handoffs/`.
+- Read the scaffolded file, then overwrite it with the structure below.
+
+Done when the returned path has been read and rewritten.
+
+### Structure
+
+```markdown
+---
+created: <timestamp>
+repository: <repo path or name>
+git_branch: <branch>
+git_commit: <commit>
+task: <task id>
+summary: <same one-line summary passed to handoff>
+type: handoff
+status: active
+---
+
+# Handoff: <task> — <brief description>
+
+## Task State
+- Current objective, status, and phase if any.
+- Completed, active, blocked, and pending items from the task graph.
+
+## Critical References
+- The 2–3 must-read paths for the next session, with why each matters.
+
+## Recent Changes
+- What changed, with `file:line` or path references.
+
+## Learnings
+- Findings that matter later, each backed by `file:line`, URL, or observation.
+
+## Artifacts
+- Everything produced or updated.
+
+## Action Items & Next Steps
+1. The exact next action.
+2. Verification or decision needed after that.
+
+## Other Notes
+- Constraints, risks, open questions, and anything deliberately not done.
+```
+
+Done when every section is populated or explicitly says `None known`, and every
+claim that can be grounded has evidence.
 
 ## Gates (irreducible)
-- Record the one-line summary via the handoff tool BEFORE writing the file.
+- Record the one-line summary with `handoff` before writing the markdown note.
 - Read the scaffold before overwriting it.
-- Cross-reference research.md and plan.md when they exist.
-- The live timeline and observations are the source of truth; the handoff
-  supplements them — never contradicts.
+- Treat timeline, observations, and task graph as source of truth; the note must
+  not contradict them.
+- Cross-reference existing `research/<topic>.md` or `plans/<topic>.md` artifacts when they matter.
+- Prefer references over code blocks; use `file:line` when line numbers are stable.
 
-Method, tool reference, and the cairn graph model: see the cairn-method skill.
+## Present to User
+
+After creating the document, respond:
+
+```
+Handoff created at: [path from tool]
+
+To resume from this handoff in a new session:
+  /workon [path from tool]
+```

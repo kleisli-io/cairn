@@ -55,10 +55,32 @@ Callers hold the connection mutex."
     (declare (ignore s m h))
     (format nil "~4,'0D-~2,'0D-~2,'0D" year month day)))
 
+(defun %date-namespace-p (slug)
+  "True when SLUG opens with a YYYY-MM-DD- date namespace."
+  (and (>= (length slug) 11)
+       (char= (char slug 4) #\-)
+       (char= (char slug 7) #\-)
+       (char= (char slug 10) #\-)
+       (every #'digit-char-p (subseq slug 0 4))
+       (every #'digit-char-p (subseq slug 5 7))
+       (every #'digit-char-p (subseq slug 8 10))))
+
+(defun %strip-date-namespace (slug)
+  "SLUG with every leading YYYY-MM-DD- date namespace removed. The namespace is
+system-owned (the creation date), so a name the caller already date-prefixed is
+stripped back to its descriptive core rather than doubling the prefix."
+  (loop with s = slug
+        while (%date-namespace-p s)
+        do (setf s (subseq s 11))
+        finally (return s)))
+
 (defun %mint-slug (name)
-  "A bare, date-prefixed task slug from a freeform NAME. Errors when nothing
-descriptive can be recovered."
-  (let* ((slug (kli/cairn/validation:slugify (or name "")))
+  "A bare, date-prefixed task slug from a freeform NAME. Any leading date
+namespace the caller supplied is dropped before today's is stamped, so minting
+is idempotent and the prefix stays singular. Errors when nothing descriptive can
+be recovered."
+  (let* ((slug (%strip-date-namespace
+                (kli/cairn/validation:slugify (or name ""))))
          (result (kli/cairn/validation:validate-task-name slug)))
     (unless (kli/cairn/validation:validation-result-valid-p result)
       (error "~S is not descriptive enough for a task name: ~A"
@@ -225,7 +247,20 @@ an authoring turn; the caller overwrites the skeleton with the rich body."
 
 ;;; --- Read tools ---
 
-(defun %render-task-get (slug status description parent children edges meta obs)
+(defun %observation-count (db id)
+  "Total observations recorded against task row ID."
+  (sqlite:execute-single db
+    "SELECT count(*) FROM observations WHERE task_id = ?" id))
+
+(defun %earlier-observations-pointer (total shown)
+  "One line pointing at the full observation history when TOTAL exceeds the SHOWN
+count, else NIL. Restores discoverability where the capped read stops at SHOWN."
+  (when (> total shown)
+    (format nil "… ~D earlier observation~:P — call timeline with full=true, types=observation to read them all"
+            (- total shown))))
+
+(defun %render-task-get (slug status description parent children edges meta obs
+                         &optional pointer)
   (with-output-to-string (out)
     (format out "~A  [~A]~%" slug status)
     (unless (%blank-p description)
@@ -244,17 +279,50 @@ an authoring turn; the caller overwrites the skeleton with the rich body."
     (when obs
       (format out "  recent:~%")
       (dolist (o obs)
-        (format out "    - ~A~%" (first o))))))
+        (format out "    - ~A~%" (first o)))
+      (when pointer (format out "    ~A~%" pointer)))))
 
-(defun %task-get-text (db slug)
-  "Rendered computed state for SLUG over DB, or NIL when no such task."
+(defun %task-get-text (db slug &key (observations t))
+  "Rendered computed state for SLUG over DB, or NIL when no such task.
+OBSERVATIONS NIL omits the recent-observations section, leaving the
+operator-authority structural frame."
   (let ((row (first (sqlite:execute-to-list db
                       "SELECT id, status, description FROM tasks WHERE slug = ?"
                       slug))))
     (when row
       (destructuring-bind (id status description) row
+        (let ((obs (when observations
+                     (sqlite:execute-to-list db
+                       "SELECT text FROM observations WHERE task_id = ?
+                         ORDER BY ts DESC, obs_id DESC LIMIT 5" id))))
+          (%render-task-get
+           slug status description
+           (sqlite:execute-single db
+             "SELECT p.slug FROM tasks c JOIN tasks p ON c.parent_task_id = p.id
+               WHERE c.id = ?" id)
+           (mapcar #'first (sqlite:execute-to-list db
+                             "SELECT slug FROM tasks WHERE parent_task_id = ?
+                               ORDER BY slug" id))
+           (sqlite:execute-to-list db
+             "SELECT d.slug, e.type FROM edges e JOIN tasks d ON e.dst_id = d.id
+               WHERE e.src_id = ? ORDER BY e.type, d.slug" id)
+           (sqlite:execute-to-list db
+             "SELECT key, value FROM task_metadata WHERE task_id = ? ORDER BY key" id)
+           obs
+           (and obs (%earlier-observations-pointer
+                     (%observation-count db id) (length obs)))))))))
+
+(defun %task-operator-frame (db slug)
+  "Non-poisonable structural frame for SLUG: slug, status, parent, children,
+edges. Excludes description, metadata, and observations -- all model-authored free
+text, which belongs in the fenced reference channel, never the operator one.
+NIL when no such task."
+  (let ((row (first (sqlite:execute-to-list db
+                      "SELECT id, status FROM tasks WHERE slug = ?" slug))))
+    (when row
+      (destructuring-bind (id status) row
         (%render-task-get
-         slug status description
+         slug status nil
          (sqlite:execute-single db
            "SELECT p.slug FROM tasks c JOIN tasks p ON c.parent_task_id = p.id
              WHERE c.id = ?" id)
@@ -264,11 +332,27 @@ an authoring turn; the caller overwrites the skeleton with the rich body."
          (sqlite:execute-to-list db
            "SELECT d.slug, e.type FROM edges e JOIN tasks d ON e.dst_id = d.id
              WHERE e.src_id = ? ORDER BY e.type, d.slug" id)
-         (sqlite:execute-to-list db
-           "SELECT key, value FROM task_metadata WHERE task_id = ? ORDER BY key" id)
-         (sqlite:execute-to-list db
-           "SELECT text FROM observations WHERE task_id = ?
-             ORDER BY ts DESC, obs_id DESC LIMIT 5" id))))))
+         nil
+         nil)))))
+
+(defun %task-free-text (db slug)
+  "Model-authored free text for SLUG: description and metadata key/values.
+Reference (fenced) data, never operator authority. NIL when there is none."
+  (let ((row (first (sqlite:execute-to-list db
+                      "SELECT id, description FROM tasks WHERE slug = ?" slug))))
+    (when row
+      (destructuring-bind (id description) row
+        (let* ((meta (sqlite:execute-to-list db
+                       "SELECT key, value FROM task_metadata WHERE task_id = ?
+                         ORDER BY key" id))
+               (s (with-output-to-string (out)
+                    (unless (%blank-p description)
+                      (format out "description: ~A~%" description))
+                    (when meta
+                      (format out "metadata:~%")
+                      (dolist (m meta)
+                        (format out "  ~A = ~A~%" (first m) (second m)))))))
+          (when (plusp (length s)) s))))))
 
 (defun run-task-get (tool parameters context &key call-id on-update)
   (declare (ignore tool call-id on-update))
@@ -314,37 +398,194 @@ carries no salient field."
       ((string= type "artifact.create") (format nil "~A~@[ [~A]~]" (d :path) (d :kind)))
       (t ""))))
 
+(defun %split-comma (string)
+  "STRING split on commas into substrings, without trimming."
+  (let ((parts '()) (start 0))
+    (loop for pos = (position #\, string :start start)
+          do (push (subseq string start (or pos (length string))) parts)
+             (if pos (setf start (1+ pos)) (return)))
+    (nreverse parts)))
+
+(defun %parse-types (raw)
+  "RAW comma-separated type filter as a list of trimmed, non-empty type strings;
+NIL (meaning all types) when RAW is blank."
+  (unless (%blank-p raw)
+    (remove-if (lambda (s) (zerop (length s)))
+               (mapcar (lambda (s) (string-trim '(#\Space #\Tab) s))
+                       (%split-comma raw)))))
+
+(defun %seq-bound (raw name)
+  "RAW as an integer seq bound; NIL when blank. A non-integer is a caller error
+named by NAME, never a silent misread."
+  (cond ((null raw) nil)
+        ((integerp raw) raw)
+        ((and (stringp raw) (%blank-p raw)) nil)
+        ((stringp raw)
+         (handler-case (parse-integer (string-trim '(#\Space) raw))
+           (error () (error "~A must be an integer, got ~S." name raw))))
+        (t (error "~A must be an integer." name))))
+
+(defun %unknown-timeline-type (db types)
+  "The first requested TYPE absent from DB's live event vocabulary, paired with a
+nearest-match hint; NIL when every requested type exists. Guards a typo from
+silently yielding an empty timeline."
+  (when types
+    (let ((known (mapcar #'first
+                         (sqlite:execute-to-list db
+                           "SELECT DISTINCT type FROM events ORDER BY type"))))
+      (dolist (ty types)
+        (unless (member ty known :test #'string=)
+          (return (cons ty (%suggest ty known))))))))
+
+(defun %timeline-events (db slug types before after limit)
+  "Rows (seq type data ts) for SLUG, newest seq first, filtered to TYPES
+(NIL = all) and the exclusive seq window (AFTER, BEFORE) (a NIL bound is open),
+capped at LIMIT."
+  (let ((sql (with-output-to-string (q)
+               (write-string "SELECT seq, type, data, ts FROM events WHERE task_id = ?" q)
+               (when types (format q " AND type IN (~{~*?~^, ~})" types))
+               (when before (write-string " AND seq < ?" q))
+               (when after (write-string " AND seq > ?" q))
+               (write-string " ORDER BY seq DESC LIMIT ?" q)))
+        (args (append (list slug) types
+                      (when before (list before))
+                      (when after (list after))
+                      (list limit))))
+    (apply #'sqlite:execute-to-list db sql args)))
+
+(defun %timeline-remaining (db slug types after cursor)
+  "Count of events older than CURSOR (seq < CURSOR) still matching SLUG, the TYPES
+filter, and the AFTER floor — the events a continuation page would surface."
+  (let ((sql (with-output-to-string (q)
+               (write-string "SELECT count(*) FROM events WHERE task_id = ? AND seq < ?" q)
+               (when types (format q " AND type IN (~{~*?~^, ~})" types))
+               (when after (write-string " AND seq > ?" q))))
+        (args (append (list slug cursor) types (when after (list after)))))
+    (apply #'sqlite:execute-single db sql args)))
+
+(defun %utc-minute (universal-time)
+  "UNIVERSAL-TIME as YYYY-MM-DD HH:MM in UTC, minute precision."
+  (multiple-value-bind (s m h day month year) (decode-universal-time universal-time 0)
+    (declare (ignore s))
+    (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D" year month day h m)))
+
+(defun %write-indented (out text indent)
+  "Write TEXT to OUT, prefixing every line with INDENT and preserving newlines."
+  (with-input-from-string (in text)
+    (loop for line = (read-line in nil nil)
+          while line
+          do (write-string indent out) (write-string line out) (terpri out))))
+
+(defun %render-timeline-digest (out row)
+  "One-line digest row, byte-for-byte the historical timeline rendering."
+  (destructuring-bind (seq type data ts) row
+    (declare (ignore ts))
+    (let ((digest (%event-oneline
+                   (%event-digest type (%json->lisp (com.inuoe.jzon:parse data)))
+                   140)))
+      (format out "  ~D  ~A~@[  ~A~]~%"
+              seq type
+              (and (plusp (length digest)) digest)))))
+
+(defun %render-timeline-full (out row)
+  "Header line `<seq>  <type>  (<utc> UTC)` then the verbatim event body: an
+indented block when multi-line, inline when short, nothing when empty. No
+whitespace collapse, no length cut."
+  (destructuring-bind (seq type data ts) row
+    (let ((body (%event-digest type (%json->lisp (com.inuoe.jzon:parse data)))))
+      (format out "~D  ~A  (~A UTC)" seq type (%utc-minute ts))
+      (cond
+        ((zerop (length body)) (terpri out))
+        ((find #\Newline body) (terpri out) (%write-indented out body "    "))
+        (t (format out "  ~A~%" body))))))
+
+(defparameter *cairn-timeline-output-budget-chars* 16000
+  "Soft ceiling on timeline body output. When the next event would push the body
+past it, emission stops and prints a continuation cursor instead of the event.
+A safety backstop independent of limit and of full; at least one event always
+emits so a single oversized event can still be read.")
+
+(defun %emit-timeline (out db slug rows full types after)
+  "Render ROWS into OUT newest-first, stopping before the first event that would
+push the rendered body past *cairn-timeline-output-budget-chars* and printing a
+continuation cursor naming the before_seq to resume from. Below the budget the
+output is exactly the per-event rendering, nothing added."
+  (let ((budget *cairn-timeline-output-budget-chars*)
+        (used 0)
+        (last-seq nil))
+    (dolist (r rows)
+      (let ((chunk (with-output-to-string (s)
+                     (if full
+                         (%render-timeline-full s r)
+                         (%render-timeline-digest s r)))))
+        (when (and last-seq (> (+ used (length chunk)) budget))
+          (format out "… truncated at ~D chars; ~D event~:P remaining; pass before_seq=~D to continue~%"
+                  used (%timeline-remaining db slug types after last-seq) last-seq)
+          (return))
+        (write-string chunk out)
+        (incf used (length chunk))
+        (setf last-seq (first r))))))
+
 (defun run-timeline (tool parameters context &key call-id on-update)
   (declare (ignore tool call-id on-update))
   (let ((slug (resolve-target-task parameters context))
-        (limit (%limit (tool-parameter parameters :limit) 20)))
+        (limit (%limit (tool-parameter parameters :limit) 20))
+        (types (%parse-types (tool-parameter parameters :types)))
+        (before (%seq-bound (tool-parameter parameters :before_seq) "before_seq"))
+        (after (%seq-bound (tool-parameter parameters :after_seq) "after_seq"))
+        (full (tool-parameter parameters :full)))
     (with-cairn-store-lock (context)
-      (let ((rows (sqlite:execute-to-list (context-db context)
-                    "SELECT seq, type, data FROM events WHERE task_id = ?
-                      ORDER BY seq DESC LIMIT ?" slug limit)))
-        (%text
-         (with-output-to-string (out)
-           (format out "~A — last ~D events~%" slug (length rows))
-           (dolist (r rows)
-             (destructuring-bind (seq type data) r
-               (let ((digest (%event-oneline
-                              (%event-digest type (%json->lisp (com.inuoe.jzon:parse data)))
-                              140)))
-                 (format out "  ~D  ~A~@[  ~A~]~%"
-                         seq type
-                         (and (plusp (length digest)) digest)))))))))))
+      (let* ((db (context-db context))
+             (bad (%unknown-timeline-type db types)))
+        (if bad
+            (%fail "unknown event type ~S; ~A" (car bad) (cdr bad))
+            (let ((rows (%timeline-events db slug types before after limit)))
+              (%text
+               (with-output-to-string (out)
+                 (format out "~A — last ~D events~%" slug (length rows))
+                 (%emit-timeline out db slug rows full types after)))))))))
 
-;;; --- Orientation: one-call bootstrap + swarm readout ---
-
-(defun %session-abbrev (sid)
-  (if (and (stringp sid) (> (length sid) 8)) (subseq sid 0 8) sid))
-
-(defun %minutes-ago (ts)
-  (max 0 (round (- (get-universal-time) ts) 60)))
+;;; --- Orientation: one-call bootstrap ---
 
 (defun %recent-task-slugs (db &optional (limit 5))
   (mapcar #'first (sqlite:execute-to-list db
                     "SELECT slug FROM tasks ORDER BY updated_ts DESC LIMIT ?" limit)))
+
+(defun %like-escape (string)
+  "STRING with the LIKE metacharacters % and _ and the escape char \\ each
+backslash-escaped, for a pattern run under ESCAPE '\\'."
+  (with-output-to-string (out)
+    (loop for ch across string do
+      (when (member ch '(#\% #\_ #\\)) (write-char #\\ out))
+      (write-char ch out))))
+
+(defun %search-task-slugs (db query &optional limit)
+  "(slug . description) candidates for QUERY over DB, recent-first and excluding
+the @-namespaced internal slugs, so the completion popup can scroll the full set.
+A blank QUERY lists every task most-recent-first; otherwise prefix matches
+(index-backed) rank above substring matches (a bounded scan), each ordered by
+recency. LIMIT caps the row count when given, else the result is unbounded.
+Descriptions collapse to one line; a blank description yields the bare slug."
+  (flet ((shape (row)
+           (destructuring-bind (slug description) row
+             (if (%blank-p description)
+                 slug
+                 (cons slug (%event-oneline description 80))))))
+    (let ((cap (if limit (format nil " LIMIT ~D" (max 1 limit)) "")))
+      (mapcar #'shape
+              (if (%blank-p query)
+                  (sqlite:execute-to-list db
+                    (concatenate 'string
+                      "SELECT slug, description FROM tasks WHERE slug NOT LIKE '@%'
+                        ORDER BY updated_ts DESC" cap))
+                  (let ((esc (%like-escape query)))
+                    (sqlite:execute-to-list db
+                      (concatenate 'string
+                        "SELECT slug, description FROM tasks
+                          WHERE slug LIKE ? ESCAPE '\\' AND slug NOT LIKE '@%'
+                          ORDER BY (slug LIKE ? ESCAPE '\\') DESC, updated_ts DESC"
+                        cap)
+                      (format nil "%~A%" esc) (format nil "~A%" esc))))))))
 
 (defun %open-handoffs-text (db slug &optional (limit 3))
   "The latest handoff summaries for SLUG, or NIL when none."
@@ -359,43 +600,16 @@ carries no salient field."
             (format out "    - ~A~@[ (~A)~]~%"
                     summary (and (stringp path) (plusp (length path)) path))))))))
 
-(defun %swarm-readout (db me task-slug &key (window-minutes 60) (limit 20))
-  "Each other session's latest activity within the window: its session, the task
-it last touched, the event type, and minutes since. Sessions last active on
-TASK-SLUG are flagged as concurrent work. ME, when non-NIL, is excluded."
-  (let* ((cutoff (- (get-universal-time) (* window-minutes 60)))
-         (rows (sqlite:execute-to-list db
-                 "SELECT e.session_id, e.task_id, e.type, e.ts
-                    FROM events e
-                    JOIN (SELECT session_id, MAX(seq) AS max_seq
-                            FROM events
-                           WHERE session_id IS NOT NULL AND ts >= ?
-                           GROUP BY session_id) m
-                      ON e.session_id = m.session_id AND e.seq = m.max_seq
-                   WHERE (? IS NULL OR e.session_id <> ?)
-                   ORDER BY e.ts DESC
-                   LIMIT ?"
-                 cutoff me me limit)))
-    (with-output-to-string (out)
-      (if (null rows)
-          (format out "  swarm: no other sessions active in the last ~Dm~%" window-minutes)
-          (progn
-            (format out "  swarm (~D active, last ~Dm):~%" (length rows) window-minutes)
-            (dolist (r rows)
-              (destructuring-bind (sid stask type ts) r
-                (format out "    ~A on ~A — ~A ~Dm ago~A~%"
-                        (%session-abbrev sid) (or stask "?") type (%minutes-ago ts)
-                        (if (and task-slug stask (string= stask task-slug))
-                            " (also on this task)" "")))))))))
-
 (defun run-task-bootstrap (tool parameters context &key call-id on-update)
-  "One-call orientation on a task: computed state, neighbors, open handoffs,
-recent observations, and a readout of what other sessions are doing. Adopts the
-task as current only when no current task is set; never overrides an existing
-pointer, and records no event."
+  "One-call orientation on a task: computed state, neighbors, open handoffs, and
+recent observations. An explicit task_id switches the current pointer to that
+task — orienting on a task makes it current, so spawned sessions and the injected
+context agree on which task is in focus. With no task_id, orients on the current
+task and adopts it only when none is set. Records no event; switches the pointer
+only after the task is found."
   (declare (ignore tool call-id on-update))
-  (let ((target (or (%bare-slug (tool-parameter parameters :task_id))
-                    (current-task-id context))))
+  (let* ((explicit (%bare-slug (tool-parameter parameters :task_id)))
+         (target (or explicit (current-task-id context))))
     (if (null target)
         (%fail "No task to bootstrap; pass task_id or select a task first.")
         (with-cairn-store-lock (context)
@@ -405,13 +619,10 @@ pointer, and records no event."
                 (%fail "No task ~A.~@[ Recent: ~{~A~^, ~}~]"
                        target (%recent-task-slugs db))
                 (progn
-                  (unless (current-task-id context)
+                  (when (or explicit (null (current-task-id context)))
                     (setf (current-task-id context) target))
                   (%text
                    (with-output-to-string (out)
                      (write-string state out)
                      (let ((h (%open-handoffs-text db target)))
-                       (when h (write-string h out)))
-                     (write-string
-                      (%swarm-readout db (current-session-id context) target)
-                      out))))))))))
+                       (when h (write-string h out))))))))))))

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/cairn-logo.png" alt="cairn" width="220" />
+<img src="assets/cairn-logo.png" alt="cairn" width="720" />
 
 # cairn
 
@@ -18,6 +18,8 @@ When the session resets, the agent reloads the plan from the graph instead of re
   <img alt="SQLite FTS5" src="https://img.shields.io/badge/SQLite-FTS5-003B57.svg?logo=sqlite&logoColor=white">
 </p>
 
+<br />
+
 </div>
 
 An AI coding agent is sharp for the length of a session. Then the context resets and it loses the thread. It no longer knows what's already done, what it was in the middle of, or why the last few decisions went the way they did. The plan lived in the conversation, so once the conversation ends the plan is gone, and the agent either redoes finished work or stops to ask you where things stand.
@@ -34,7 +36,7 @@ The tool keeps that habit. Each session leaves a little more on the graph and mo
 
 > ### Works with any MCP agent
 >
-> cairn ships as an extension for [kli](https://github.com/kleisli-io/kli), and one kli command serves it to anything that speaks the Model Context Protocol. Run `kli mcp-serve cairn`, point Claude Code, Claude Desktop, Cursor, or another MCP client at it, and cairn's tools appear as MCP tools, with its workflow prompts and the `cairn-method` skill exposed as MCP prompts and readable resources. Using cairn doesn't mean adopting kli as your main agent; any MCP client works.
+> cairn ships as an extension for [kli](https://github.com/kleisli-io/kli), and one kli command serves it to anything that speaks the Model Context Protocol. Run `kli mcp-serve cairn`, point Claude Code, Claude Desktop, Cursor, or another MCP client at it, and cairn's tools appear as MCP tools, with its workflow prompts exposed as MCP prompts and readable resources. Using cairn doesn't mean adopting kli as your main agent; any MCP client works.
 
 ---
 
@@ -75,7 +77,7 @@ Run `kli` in a project directory, and that working directory selects the project
 
 Driving cairn from its host gives you more than the tool surface. The agent gets cairn's tools, and you get slash commands for steering the work by hand:
 
-- `/resume [id]` reopens a task and drops a resume block into the transcript, so the agent picks up where it left off.
+- `/workon [id]` selects a task and seeds a re-entry turn, so the agent picks up where it left off.
 - `/handoff [guidance]` composes and records a resumable handoff for the current task.
 - `/observe <text>` records an observation without leaving the editor.
 - `/task [id]` shows the current task, or switches to another by id.
@@ -111,9 +113,15 @@ The client launches kli in your project directory, and that working directory pi
 
 > One `mcp-serve` process serves a single client and exposes only the extensions you name, so pointing it at cairn gives you cairn's tools and nothing more. Capability gating carries over. The serve subject holds exactly the capabilities its exposed tools declare, so the read / write / observe split still applies over MCP.
 
-A client reached this way gets cairn's tools, plus its workflow prompts and the `cairn-method` skill as MCP prompts and resources. The slash commands, the per-turn context, and the compaction folding do not travel over the tool protocol, since kli provides those as the host. That is why kli is the fuller home for cairn.
+A client reached this way gets cairn's tools plus its workflow prompts as MCP prompts and resources. The slash commands, the per-turn context, and the compaction folding do not travel over the tool protocol, since kli provides those as the host. That is why kli is the fuller home for cairn.
 
 For the full tool reference, the complete TQ grammar, and the edge model, see **[docs.kleisli.io/cairn](https://docs.kleisli.io/cairn)**.
+
+### Startup time with large histories
+
+On first open, cairn reconciles the append-only task logs into its SQLite projection and stamps watermarks so later opens can skip unchanged logs. Large histories make that first reconcile visible: thousands of `events.ndjson` files or tens of megabytes of log data can take tens of seconds while the `cairn.db` projection is created or rebuilt. Once the database and watermarks are warm, startup is usually much faster.
+
+If your workflow creates a fresh checkout or disposable workspace for every session, copy or persist the `.kli/cairn.db*` files along with `.kli/tasks/` when you want to avoid paying the first-open reconcile cost each time. The logs remain the source of truth; the database is a rebuildable projection.
 
 ### Building from source
 
@@ -132,7 +140,7 @@ cairn keeps two things, a **task graph** and an **observation store**.
 - **Edges** are typed. `phase-of` is the structural parent/child link, and a task has at most one parent. `depends-on` and `related` are lateral. A plan is a task DAG, where phases are the children and `depends-on` sets their order.
 - **Observations** are freeform notes appended to a task and stored as events. They are cheap, so you record them as you go.
 - **Durability.** Every write appends one event to the log and folds into a queryable projection. Replay the log and the same projection comes back, your own views and full history included.
-- **The current task is per session.** Each session keeps its own current-task pointer, and most tools act on it unless you pass an explicit `task_id`. `task_create`, `task_bootstrap`, and `task_fork` adopt the current task only when none is set; `task_fork` always makes its new child current.
+- **The current task is per session.** Each session keeps its own current-task pointer, and most tools act on it unless you pass an explicit `task_id`. `task_create` adopts the current task only when none is set; `task_bootstrap` with an explicit `task_id` switches the pointer to that task (orienting focuses it); `task_fork` always makes its new child current.
 
 ## The tools
 
@@ -148,16 +156,17 @@ cairn exposes a fixed set of tools, capability-gated into read, write, and obser
 
 `task_bootstrap` is the one-call re-entry point for a session. It returns state, neighbors, open handoffs, recent observations, and a short readout of what other sessions are doing.
 
-### task_query (TQ) — query the plan
+### task_query (TQ) — query the task graph
 
-A TQ query is a **source** form, optionally threaded through **steps** with `->`. Transformer steps compose, taking a node-set to a node-set; shaper steps end the chain in a value. The grammar includes set algebra (`:union`, `:intersect`, `:minus`), coalescing (`:or-else`), transitive `:closure`, predicates, and quantifiers.
+A TQ query is a **source** form, optionally threaded through **steps** with `->`. Use `task_query` for task identity/name/slug/status/metadata lookup and graph relationships. `task_search` is different: it searches observation text only, not task names or slugs. The grammar includes set algebra (`:union`, `:intersect`, `:minus`), coalescing (`:or-else`), transitive `:closure`, predicates, and quantifiers.
 
 ```lisp
+(-> (all) (:where (matches :slug "compaction")) (:select :slug :status)) ; find tasks by slug
 (-> (current) (:follow :phase-of) (:ids))          ; the current task's child phases
 (-> (active) (:where (> :obs-count 10)) (:count))  ; active tasks with lots of observations
 ```
 
-> TQ describes itself. Probe `(schema)` for sources and steps, `(views)` for named views, `(fields)` for queryable fields, and `(edges)` for edge types. Each probe answers as a query you can thread through the same steps, so the reflection can't fall out of sync with the behavior. The read/write split is a capability gate. `task_query` refuses mutating `!`-forms, and `task_query_write` accepts them.
+> TQ describes itself. Probe `(schema)` for sources, steps, predicates, and write forms (steps and predicates with their argument signatures), `(views)` for named views, `(fields)` for queryable fields, and `(edges)` for edge types. Each probe answers as a query you can thread through the same steps, so the reflection can't fall out of sync with the behavior. An unknown name — a field, predicate, step, source, or edge — errors with a nearest-match suggestion rather than misfiring silently, and timestamps are universal-time so a calendar intent like `(on :updated-ts "2026-06-24")` is one predicate. The read/write split is a capability gate. `task_query` refuses mutating `!`-forms, and `task_query_write` accepts them.
 
 Named views ship built in and are reached through the `query` source, as in `(query "plan-frontier")`. They include `plan-frontier` (the phases ready to start), `stale-phases`, `busy`, `active-roots`, and more. You can add your own with `task_query_write`, where `(define! "name" Q)` stores a view as an event so it replays like any other fact. The full grammar, every tool, and the edge model live at **[docs.kleisli.io/cairn](https://docs.kleisli.io/cairn)**.
 
@@ -167,7 +176,7 @@ Named views ship built in and are reached through the `query` source, as in `(qu
 - **SQLite with FTS5.** This one is mandatory. The observation index is built on FTS5, and the build runs a gate that fails if the linked SQLite doesn't provide it.
 - **[kli](https://github.com/kleisli-io/kli)** as the host runtime, plus **[cl-deps](https://github.com/kleisli-io/cl-deps)**, both wired in as flake inputs.
 
-cairn registers as a kli extension via `defextension cairn`. It requires kli's `config/v1` and `events/v1` capabilities and provides its tools, the bundled prompts, the `cairn-method` skill, and context/compaction effects.
+cairn registers as a kli extension via `defextension cairn`. It requires kli's `config/v1` and `events/v1` capabilities and provides its tools, bundled prompts, and context/compaction effects.
 
 ## Flake outputs
 

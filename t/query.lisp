@@ -490,8 +490,9 @@ the numeric ones, and the count matches the registry."
         (is (search f numeric) (format nil "~A is a numeric field" f)))
       (is (not (search "description" numeric)) "a text field is not selected as numeric"))
     (is (search (format nil "~D" (length cairn::+field-types+))
-                (query-text protocol context "(-> (fields) (:count))"))
-        "the field count matches the registry")))
+                (query-text protocol context
+                  "(-> (fields) (:where (= :origin \"declared\")) (:count))"))
+        "every declared field is listed")))
 
 (test the-edges-source-classifies-each-edge-type
   "(edges) renders the edge vocabulary with each type's class; the structural
@@ -636,3 +637,152 @@ write vocabulary is discoverable, not hardcoded in a description."
                   "(-> (schema) (:where (= :kind \"mutation\")) (:ids))")))
       (dolist (s '("set-status!" "set!" "link!" "unlink!"))
         (is (search s muts) (format nil "~A is listed as a mutation step" s))))))
+
+;;; Typed vocabulary: an unknown name across any surface — field, predicate,
+;;; step, source, edge — fails loudly with the nearest known name, never a
+;;; silent drop or empty result. The projection renders every selected column.
+
+(test an-unknown-name-suggests-the-nearest-across-every-surface
+  "A near-miss field, predicate, step, source, or edge each errors with a 'did
+you mean' pointing at the nearest known name — one suggester over every typed
+vocabulary."
+  (with-cairn-protocol (context protocol)
+    (ext:invoke-tool protocol :task_create
+                     (list :name "the suggestion probe task") context)
+    (flet ((suggests (q near)
+             (let ((r (run-query protocol context q)))
+               (is (ext:tool-result-error-p r) (format nil "~A is rejected" q))
+               (is (search "did you mean" (tool-text r)) "the error offers a correction")
+               (is (search near (tool-text r))
+                   (format nil "the correction names ~A" near)))))
+      (suggests "(-> (all) (:select :updated-at))" "updated-ts")
+      (suggests "(-> (all) (:where (matchez :slug \"x\")))" "matches")
+      (suggests "(-> (all) (:zelect :slug))" "select")
+      (suggests "(edgez)" "edges")
+      (suggests "(-> (all) (:follow :phse-of))" "phase-of"))))
+
+(test select-validates-enriches-and-renders-every-column
+  "(:select) errors on an unknown field, enriches a derived field it projects (the
+former silent drop), and renders an absent value as ∅ rather than omitting the
+column."
+  (with-cairn-protocol (context protocol)
+    (ext:invoke-tool protocol :task_create
+                     (list :name "the projection rectangle task") context)
+    (is (ext:tool-result-error-p
+         (run-query protocol context "(-> (all) (:select :nope))"))
+        "an unknown selected field is rejected")
+    (let ((counts (query-text protocol context "(-> (all) (:select :obs-count))")))
+      (is (search "obs-count=" counts) "the derived count is projected, not dropped")
+      (is (not (search "obs-count=∅" counts)) "and carries a real number on a real task"))
+    (is (search "parent=∅" (query-text protocol context "(-> (all) (:select :parent))"))
+        "an absent field renders as the empty glyph, keeping the column")))
+
+(test a-unix-seconds-operand-is-lifted-onto-the-universal-time-clock
+  "A timestamp comparison operand below the universal-time range is read as Unix
+seconds and shifted onto the same clock the stored value uses, so the read
+surface agrees with the write surface instead of sitting below every value."
+  (with-cairn-protocol (context protocol)
+    (let ((task (created-slug
+                 (ext:invoke-tool protocol :task_create
+                                  (list :name "the operand coercion task") context))))
+      ;; 2500000000 as a raw integer sits below a recent universal-time value;
+      ;; lifted onto the clock it lands above it, so < matches and >= does not.
+      (is (search task (query-text protocol context
+                         "(-> (all) (:where (< :updated-ts 2500000000)) (:ids))"))
+          "the lifted operand lands above the recent timestamp, so < matches")
+      (is (not (search task (query-text protocol context
+                              "(-> (all) (:where (>= :updated-ts 2500000000)) (:ids))")))
+          "and >= does not — it is not a raw-integer comparison"))))
+
+(defun %projected-date (text)
+  "The YYYY-MM-DD a (:select …-ts) projection prints in parentheses after the raw
+universal-time integer."
+  (let ((p (search "(2" text)))
+    (and p (subseq text (1+ p) (+ p 11)))))
+
+(test timestamp-projection-and-date-predicates-window-the-clock
+  "A projected timestamp shows its raw value and decoded UTC date; on/since/before
+window that universal-time clock by calendar day, gated to timestamp fields, with
+a malformed date a structured error."
+  (with-cairn-protocol (context protocol)
+    (let* ((task (created-slug
+                  (ext:invoke-tool protocol :task_create
+                                   (list :name "the date window task") context)))
+           (proj (query-text protocol context "(-> (all) (:select :updated-ts))"))
+           (day (%projected-date proj)))
+      (is (search "updated-ts=" proj) "the timestamp column renders")
+      (is (search "(2" proj) "with its decoded calendar date alongside the raw value")
+      (is (stringp day) "the projected date is legible")
+      (flet ((ids (pred) (query-text protocol context
+                           (node-query task (format nil "(:where ~A)" pred) "(:ids)"))))
+        (is (search task (ids (format nil "(on :updated-ts ~S)" day)))
+            "on the task's own day selects it")
+        (is (search task (ids "(since :updated-ts \"2000-01-01\")"))
+            "since a past day includes a recent task")
+        (is (not (search task (ids "(before :updated-ts \"2000-01-01\")")))
+            "before a past day excludes it")
+        (is (not (search task (ids "(since :updated-ts \"2999-01-01\")")))
+            "since a far-future day excludes it"))
+      (is (ext:tool-result-error-p
+           (run-query protocol context
+             (node-query task "(:where (on :updated-ts \"not-a-date\"))")))
+          "a malformed date is a structured error")
+      (is (ext:tool-result-error-p
+           (run-query protocol context
+             (node-query task "(:where (on :status \"2026-01-01\"))")))
+          "a date predicate over a text field is rejected"))))
+
+(test sort-orders-ascending-and-descending-and-validates-direction
+  "(:sort FIELD :asc) ascends, (:sort FIELD) and :desc descend, and a direction
+outside the enum errors with a suggestion."
+  (with-cairn-protocol (context protocol)
+    (let ((a (created-slug
+              (ext:invoke-tool protocol :task_create
+                               (list :name "alpha ordering probe") context)))
+          (z (created-slug
+              (ext:invoke-tool protocol :task_create
+                               (list :name "zeta ordering probe") context))))
+      (flet ((order (dir)
+               (query-text protocol context
+                 (format nil "(-> (all) (:sort :slug~@[ ~A~]) (:ids))" dir))))
+        (let ((asc (order ":asc")))
+          (is (< (search a asc) (search z asc)) "ascending puts alpha before zeta"))
+        (let ((desc (order ":desc")))
+          (is (< (search z desc) (search a desc)) "descending puts zeta before alpha"))
+        (let ((default (order nil)))
+          (is (< (search z default) (search a default)) "the default is descending")))
+      (let ((r (run-query protocol context "(-> (all) (:sort :slug :up))")))
+        (is (ext:tool-result-error-p r) "an unknown direction is rejected")
+        (is (search "asc" (tool-text r)) "and the enum suggestion names a valid one")))))
+
+(test the-schema-lists-predicates-with-their-rendered-signatures
+  "Predicates self-describe: (schema) tags them category=predicate and carries the
+machine-readable :signature the validator checks, so the date predicates that
+share a shape share a signature."
+  (with-cairn-protocol (context protocol)
+    (let ((preds (query-text protocol context
+                   "(-> (schema) (:where (= :category \"predicate\")) (:ids))")))
+      (dolist (p '("matches" "on" "since" "before" "all"))
+        (is (search p preds) (format nil "~A is listed as a predicate" p))))
+    (let ((dated (query-text protocol context
+                   "(-> (schema) (:where (= :signature \"field-ts lit-date\")) (:ids))")))
+      (dolist (p '("on" "since" "before"))
+        (is (search p dated)
+            (format nil "~A carries the timestamp/date signature" p))))))
+
+(test the-fields-source-exposes-metadata-keys-and-the-timestamp-epoch
+  "(fields) lists a live metadata key tagged :origin metadata, and a timestamp
+field carries the :unit and :epoch that make its clock legible without
+reverse-engineering."
+  (with-cairn-protocol (context protocol)
+    (let ((task (created-slug
+                 (ext:invoke-tool protocol :task_create
+                                  (list :name "the field reflection task") context))))
+      (run-query-write protocol context (node-query task "(:set! :priority \"high\")"))
+      (is (search "priority" (query-text protocol context
+                    "(-> (fields) (:where (= :origin \"metadata\")) (:ids))"))
+          "a metadata key is discoverable as a queryable field")
+      (let ((epoch (query-text protocol context
+                     "(-> (fields) (:where (= :slug \"updated-ts\")) (:select :unit :epoch))")))
+        (is (search "seconds" epoch) "the timestamp unit is exposed")
+        (is (search "1900-01-01" epoch) "and its epoch, so the clock is legible")))))

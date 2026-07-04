@@ -34,6 +34,11 @@ read/write gate.")
   "The tool context the write runner binds, so a `!`-form can append an event
 through the durable boundary. NIL under the read surface.")
 
+(defvar *query-fields* nil
+  "The live metadata-key half of the known-field vocabulary, computed once per
+query from the store. Unioned with the declared fields, it is the set field
+references validate against and (fields) reflects.")
+
 ;;; --- Status registry: the active/dormant partition of the model enum ---
 
 (defparameter +active-statuses+ '("open" "active" "blocked")
@@ -59,16 +64,121 @@ through the durable boundary. NIL under the read surface.")
 (defparameter +field-types+
   '((:slug . :text) (:status . :text) (:description . :text) (:depot . :text)
     (:parent . :text) (:display-name . :text)
-    (:created-ts . :number) (:updated-ts . :number) (:status-ts . :number)
+    (:created-ts . :timestamp) (:updated-ts . :timestamp) (:status-ts . :timestamp)
     (:obs-count . :number) (:edge-count . :number))
-  "Known field -> value type. A field absent here is open metadata, read on
-demand and treated as text.")
+  "Known field -> value type. A :timestamp is CL universal-time (seconds since
+1900-01-01 UTC): ordered as an integer, legible as a date. A field absent here is
+open metadata, read on demand and treated as text.")
 
 (defun %field-type (field)
   (or (cdr (assoc field +field-types+)) :text))
 
+(defun %timestamp-field-p (field)
+  (eq (%field-type field) :timestamp))
+
 (defun %numeric-field-p (field)
-  (eq (%field-type field) :number))
+  "True when FIELD compares as a number: a declared :number, or a :timestamp
+ordered by its underlying universal-time integer."
+  (let ((ty (%field-type field)))
+    (or (eq ty :number) (eq ty :timestamp))))
+
+(defun %field-name (field)
+  "FIELD keyword as a bare downcased name string."
+  (string-downcase (symbol-name field)))
+
+(defun %colon (name)
+  "A bare field/keyword NAME shown as written in a query: colon-prefixed."
+  (concatenate 'string ":" name))
+
+(defun %field-display (field)
+  "FIELD shown as the caller writes it, for error text."
+  (%colon (%field-name field)))
+
+(defun %metadata-keys (db)
+  "The DISTINCT open-metadata keys present in DB — the live half of the field
+vocabulary, discovered per query."
+  (mapcar #'first
+          (sqlite:execute-to-list db
+            "SELECT DISTINCT key FROM task_metadata ORDER BY key")))
+
+(defparameter +reflection-fields+
+  '(:category :kind :doc :signature :type :origin :source :class :unit :epoch)
+  "The synthetic prop names the reflection sources (schema/fields/edges/views)
+emit. Part of the known-field vocabulary so a predicate or projection over a
+reflective node-set type-checks, even though (fields) lists only the task
+projection's own fields.")
+
+(defun %known-field-names ()
+  "Every known field name as a bare string: the declared and reflection fields
+unioned with the live metadata keys — the candidate set for field suggestions."
+  (remove-duplicates
+   (append (mapcar (lambda (ft) (%field-name (car ft))) +field-types+)
+           (mapcar #'%field-name +reflection-fields+)
+           *query-fields*)
+   :test #'string= :from-end t))
+
+(defun %known-field-p (field)
+  "True when FIELD is a declared field, a reflection field, or a live metadata
+key."
+  (and (keywordp field)
+       (or (assoc field +field-types+)
+           (member field +reflection-fields+)
+           (member (%field-name field) *query-fields* :test #'string=))
+       t))
+
+;;; --- Suggestion + date parsing: shared typed-error machinery ---
+
+(defun %levenshtein (a b)
+  "Edit distance between strings A and B (insert/delete/substitute each cost 1)."
+  (let* ((m (length a)) (n (length b))
+         (prev (make-array (1+ n) :element-type 'fixnum))
+         (cur (make-array (1+ n) :element-type 'fixnum)))
+    (dotimes (j (1+ n)) (setf (aref prev j) j))
+    (dotimes (i m)
+      (setf (aref cur 0) (1+ i))
+      (dotimes (j n)
+        (setf (aref cur (1+ j))
+              (min (1+ (aref cur j))
+                   (1+ (aref prev (1+ j)))
+                   (+ (aref prev j) (if (char= (char a i) (char b j)) 0 1)))))
+      (rotatef prev cur))
+    (aref prev n)))
+
+(defun %suggest (name candidates &key (display #'identity))
+  "The 'did you mean' clause for an unknown NAME against CANDIDATES (bare name
+strings): the single nearest within edit distance 3, else the known list. DISPLAY
+renders a candidate for the message (e.g. colon-prefixing a field name)."
+  (let ((best nil) (best-d 4))
+    (dolist (c candidates)
+      (let ((d (%levenshtein name c)))
+        (when (< d best-d) (setf best-d d best c))))
+    (if best
+        (format nil "did you mean ~A?" (funcall display best))
+        (format nil "known: ~{~A~^, ~}."
+                (sort (mapcar display (copy-list candidates)) #'string<)))))
+
+(defun %parse-date (string)
+  "Parse a strict YYYY-MM-DD STRING to CL universal-time at UTC midnight (tz 0).
+Any deviation is a structured error, so a malformed date never silently misreads
+as an empty result."
+  (flet ((bad () (error 'cairn-query-error
+                        :message (format nil "~S is not a YYYY-MM-DD date." string))))
+    (unless (and (stringp string)
+                 (= (length string) 10)
+                 (char= (char string 4) #\-)
+                 (char= (char string 7) #\-)
+                 (every #'digit-char-p (remove #\- string)))
+      (bad))
+    (let ((y (parse-integer string :start 0 :end 4))
+          (m (parse-integer string :start 5 :end 7))
+          (d (parse-integer string :start 8 :end 10)))
+      (unless (and (<= 1 m 12) (<= 1 d 31)) (bad))
+      ;; Round-trip to reject a normalised non-date (Feb 30 rolls to March).
+      (let ((ut (handler-case (encode-universal-time 0 0 0 d m y 0) (error () (bad)))))
+        (multiple-value-bind (s mi h dd mm yy) (decode-universal-time ut 0)
+          (declare (ignore s mi h))
+          (unless (and (= dd d) (= mm m) (= yy y)) (bad))
+          ut)))))
 
 ;;; --- Node hydration: a node is (slug . props), props a plain plist ---
 
@@ -153,8 +263,8 @@ silent empty traversal. Returns (values class type-name)."
       ((structural-edge-type-p name) (values :structural name))
       ((member name +cairn-edge-types+ :test #'string=) (values :lateral name))
       (t (error 'cairn-query-error
-                :message (format nil "Unknown edge type ~A; expected one of ~{~A~^, ~}."
-                                 name (%known-edge-types)))))))
+                :message (format nil "Unknown edge type ~A; ~A" name
+                                 (%suggest name (%known-edge-types) :display #'%colon)))))))
 
 (defun %target-slugs (db nodes edge dir)
   "DISTINCT slugs reachable from NODES along EDGE in DIR (:follow or :back). The
@@ -259,11 +369,6 @@ not yet enriched."
   "FIELD's value on a node; :slug reads the node's own slug, the rest its props."
   (if (eq field :slug) slug (getf props field)))
 
-(defun %require-field (field op)
-  (unless (keywordp field)
-    (error 'cairn-query-error
-           :message (format nil "~A needs a field keyword like :status, got ~S." op field))))
-
 (defun %compile-traversal (trav op-label)
   "Compile a relative traversal — (:follow EDGE) or (:back EDGE) — into a function
 from a focus node to the node-set one hop away. The edge is validated eagerly, so
@@ -313,87 +418,379 @@ field keyword must be declared numeric; (count TRAV) is numeric by construction.
               :message (format nil "~A needs a numeric field or (count TRAV), got ~S."
                                op-label lhs)))))
 
-(defun %numeric-pred (op-fn op-label lhs value)
-  "Compile a numeric comparison. The left side is a numeric field or (count TRAV)
-and the operand a real number, else the query is ill-typed and errors — a smart
-model must be able to tell a type error from an empty result."
-  (let ((getter (%numeric-lhs lhs op-label)))
-    (unless (realp value)
-      (error 'cairn-query-error
-             :message (format nil "~A needs a real-number operand, got ~S." op-label value)))
+(defun %compile-numeric (form op-fn op-label)
+  "Compile a numeric comparison FORM (already signature-checked). A timestamp LHS
+runs an integer operand through canonical-ts, so a Unix-second literal lands on
+the same universal-time clock the write path uses instead of silently sitting
+below every value."
+  (let* ((lhs (second form))
+         (raw (third form))
+         (getter (%numeric-lhs lhs op-label))
+         (operand (if (and (keywordp lhs) (%timestamp-field-p lhs) (integerp raw))
+                      (canonical-ts raw)
+                      raw)))
     (lambda (slug props)
       (let ((v (funcall getter slug props)))
-        (and (realp v) (funcall op-fn v value))))))
+        (and (realp v) (funcall op-fn v operand))))))
+
+;;; --- Argument signatures: one typed checker over the closed arg-kind set ---
+;;
+;; A signature is a list of arg-kind specs describing a form's arguments. One
+;; %check-signature validates any form against its declared kinds and emits
+;; uniform structured errors, so a predicate, step, or source carries its
+;; argument contract as data the interpreter checks, reflection renders, and the
+;; suggester corrects against. The kinds:
+;;   (:field-ref text|number|timestamp|any) — a known field of the given class
+;;   (:value-expr numeric|any)              — a field-ref or (count TRAV)
+;;   (:literal string|real|date|any)        — a constant operand
+;;   :traversal                             — (:follow EDGE) | (:back EDGE)
+;;   :sub-predicate / :sub-predicate*       — a nested predicate / one-or-more
+;;   :edge / :edge*                         — an edge type / one-or-more
+;;   :field-list                            — one-or-more field-refs
+;;   :integer / :sub-query                  — a take count / a node-set form
+;;   (:enum NAME...)                        — one of the listed keywords
+;;   (:opt KIND)                            — an optional trailing argument
+
+(defun %enum-token (member)
+  "An enum MEMBER as the bare token it matches on: a keyword member by its
+downcased name, a string member by itself."
+  (if (keywordp member) (string-downcase (symbol-name member)) member))
+
+(defun %enum-value-token (value)
+  "A caller's VALUE reduced to its enum token, or NIL when it cannot name one."
+  (cond ((keywordp value) (string-downcase (symbol-name value)))
+        ((stringp value) value)
+        (t nil)))
+
+(defun %kind-token (kind)
+  "KIND rendered as a short machine token for the signature line and its doc."
+  (flet ((q (base type) (ecase type
+                          (:any base)
+                          (:text (concatenate 'string base "-text"))
+                          ((:number :numeric) (concatenate 'string base "-num"))
+                          (:timestamp (concatenate 'string base "-ts"))
+                          (:string (concatenate 'string base "-str"))
+                          (:real (concatenate 'string base "-real"))
+                          (:date (concatenate 'string base "-date")))))
+    (cond
+      ((eq kind :traversal) "traversal")
+      ((eq kind :sub-predicate) "pred")
+      ((eq kind :sub-predicate*) "pred...")
+      ((eq kind :edge) "edge")
+      ((eq kind :edge*) "edge...")
+      ((eq kind :field-list) "field...")
+      ((eq kind :integer) "int")
+      ((eq kind :sub-query) "query")
+      ((consp kind)
+       (ecase (car kind)
+         (:field-ref (q "field" (cadr kind)))
+         (:value-expr (q "value" (cadr kind)))
+         (:literal (q "lit" (cadr kind)))
+         (:enum (format nil "~{~A~^|~}" (mapcar #'%enum-token (cdr kind))))
+         (:opt (format nil "[~A]" (%kind-token (cadr kind))))))
+      (t (string-downcase (symbol-name kind))))))
+
+(defun %a/an (word)
+  "The indefinite article agreeing with WORD's initial sound."
+  (if (and (plusp (length word)) (find (char-downcase (char word 0)) "aeiou")) "an" "a"))
+
+(defun %render-signature (signature)
+  "SIGNATURE as a space-separated token line: the machine-readable contract
+reflection renders and a doc derives from."
+  (format nil "~{~A~^ ~}" (mapcar #'%kind-token signature)))
+
+(defun %check-field-ref (field type head)
+  (unless (keywordp field)
+    (error 'cairn-query-error
+           :message (format nil "~A needs a field name like :status, got ~S." head field)))
+  (unless (%known-field-p field)
+    (error 'cairn-query-error
+           :message (format nil "Unknown field ~A; ~A" (%field-display field)
+                            (%suggest (%field-name field) (%known-field-names) :display #'%colon))))
+  (ecase type
+    (:any t)
+    (:text
+     (unless (eq (%field-type field) :text)
+       (error 'cairn-query-error
+              :message (format nil "~A needs a text field; ~A is ~(~A~)."
+                               head (%field-display field) (%field-type field)))))
+    (:number
+     (unless (%numeric-field-p field)
+       (error 'cairn-query-error
+              :message (format nil "~A needs a numeric field; ~A is ~(~A~)."
+                               head (%field-display field) (%field-type field)))))
+    (:timestamp
+     (unless (%timestamp-field-p field)
+       (error 'cairn-query-error
+              :message (format nil "~A needs a timestamp field; ~A is ~(~A~)."
+                               head (%field-display field) (%field-type field))))))
+  t)
+
+(defun %check-value-expr (expr numericp head)
+  "EXPR is a field-ref or (count TRAV); the numeric form needs a numeric field
+((count TRAV) is numeric by construction)."
+  (cond
+    ((keywordp expr) (%check-field-ref expr (if numericp :number :any) head))
+    ((%count-expr-p expr) (%check-traversal (second expr) head))
+    (t (error 'cairn-query-error
+              :message (format nil "~A needs a field name or (count TRAV), got ~S." head expr))))
+  t)
+
+(defun %check-literal (value type head)
+  (ecase type
+    (:any t)
+    (:string
+     (unless (stringp value)
+       (error 'cairn-query-error
+              :message (format nil "~A needs a string, got ~S." head value))))
+    (:real
+     (unless (realp value)
+       (error 'cairn-query-error
+              :message (format nil "~A needs a real-number operand, got ~S." head value))))
+    (:date (%parse-date value)))
+  t)
+
+(defun %check-traversal (trav head)
+  (unless (and (consp trav) (member (car trav) '(:follow :back)))
+    (error 'cairn-query-error
+           :message (format nil "~A needs a traversal (:follow EDGE) or (:back EDGE), got ~S."
+                            head trav)))
+  (%edge-class (second trav))
+  t)
+
+(defun %check-enum (value members head)
+  "VALUE must name one of MEMBERS (homogeneous keywords or strings). The display
+follows the member style — keywords colon-prefixed, strings quoted — so the
+suggestion reads as the caller would write it."
+  (let* ((tokens (mapcar #'%enum-token members))
+         (keyworded (keywordp (first members)))
+         (display (if keyworded #'%colon (lambda (s) (format nil "~S" s))))
+         (vt (%enum-value-token value)))
+    (unless (and vt (member vt tokens :test #'string=))
+      (error 'cairn-query-error
+             :message (format nil "~A needs ~{~A~^ or ~}~@[; ~A~]"
+                              head (mapcar display tokens)
+                              (and vt (%suggest vt tokens :display display))))))
+  t)
+
+(defun %check-arg (kind arg head)
+  "Validate one ARG against one arg-KIND for the form named HEAD."
+  (cond
+    ((eq kind :traversal) (%check-traversal arg head))
+    ((eq kind :edge) (%edge-class arg))
+    ((eq kind :integer)
+     (unless (integerp arg)
+       (error 'cairn-query-error
+              :message (format nil "~A needs an integer, got ~S." head arg))))
+    ((eq kind :sub-predicate)
+     (unless (consp arg)
+       (error 'cairn-query-error
+              :message (format nil "~A needs a predicate like (= :status \"active\"), got ~S."
+                               head arg))))
+    ((eq kind :sub-query)
+     (unless (consp arg)
+       (error 'cairn-query-error
+              :message (format nil "~A needs a sub-query, got ~S." head arg))))
+    ((consp kind)
+     (ecase (car kind)
+       (:field-ref (%check-field-ref arg (cadr kind) head))
+       (:value-expr (%check-value-expr arg (eq (cadr kind) :numeric) head))
+       (:literal (%check-literal arg (cadr kind) head))
+       (:enum (%check-enum arg (cdr kind) head))))
+    (t (error "Internal: unknown arg-kind ~S." kind)))
+  t)
+
+(defun %check-signature (head args signature)
+  "Validate ARGS (a form's cdr) against SIGNATURE, a list of arg-kind specs, for
+the form named HEAD. A variadic kind (:sub-predicate*, :edge*, :field-list)
+consumes the rest; (:opt KIND) allows the final argument to be absent. Signals a
+structured error on any mismatch; returns T."
+  (let ((rest args))
+    (dolist (spec signature)
+      (cond
+        ((member spec '(:sub-predicate* :edge* :field-list))
+         (when (null rest)
+           (error 'cairn-query-error
+                  :message (format nil "~A needs at least one ~A." head
+                                   (ecase spec
+                                     (:sub-predicate* "predicate")
+                                     (:edge* "edge type")
+                                     (:field-list "field")))))
+         (let ((elt (ecase spec
+                      (:sub-predicate* :sub-predicate)
+                      (:edge* :edge)
+                      (:field-list '(:field-ref :any)))))
+           (dolist (a rest) (%check-arg elt a head)))
+         (setf rest nil))
+        ((and (consp spec) (eq (car spec) :opt))
+         (when rest
+           (%check-arg (cadr spec) (car rest) head)
+           (setf rest (cdr rest))))
+        (t
+         (when (null rest)
+           (let ((tok (%kind-token spec)))
+             (error 'cairn-query-error
+                    :message (format nil "~A needs ~A ~A argument." head (%a/an tok) tok))))
+         (%check-arg spec (car rest) head)
+         (setf rest (cdr rest)))))
+    (when rest
+      (error 'cairn-query-error
+             :message (format nil "~A takes ~D argument~:P, got ~D."
+                              head (length signature) (length args))))
+    t))
+
+;;; --- Predicate registry: the leaf/combinator/quantifier vocabulary ---
+;;
+;; Predicates are a typed registry like sources and steps, closing the one place
+;; the grammar was a hardcoded cond. Each entry carries a machine-readable
+;; signature the one %check-signature validates, a compiler lowering the form to
+;; a (slug props)->boolean test, and a kind reflection renders. Combinators and
+;; quantifiers recurse through interpret-where, so the algebra nests for free.
+
+(defstruct (tq-predicate (:conc-name tqp-))
+  (key nil :read-only t)
+  (kind nil :read-only t)
+  (signature nil :read-only t)
+  (compiler nil :read-only t)
+  (doc nil :read-only t))
+
+(defun %compile-quantifier (test)
+  "Build a quantifier compiler applying TEST (every/some/notany) to the inner
+predicate over each task one traversal hop from the focus node."
+  (lambda (form)
+    (let ((traverse (%compile-traversal (second form)
+                                        (format nil "(~A ...)" (%pred-head form))))
+          (inner (interpret-where (third form)))
+          (fields (%extract-fields (third form))))
+      (lambda (slug props)
+        (let ((nodes (%maybe-enrich *query-db*
+                                    (funcall traverse (cons slug props))
+                                    fields)))
+          (funcall test (lambda (n) (funcall inner (car n) (cdr n))) nodes))))))
+
+(defun %compile-date-pred (test)
+  "Build a date-predicate compiler running TEST over the field's universal-time
+value V and the UTC day START parsed from the operand (END = START + one day)."
+  (lambda (form)
+    (let* ((field (second form))
+           (start (%parse-date (third form)))
+           (end (+ start 86400)))
+      (lambda (slug props)
+        (let ((v (%field-value field slug props)))
+          (and (realp v) (funcall test v start end)))))))
+
+(defparameter +tq-predicates+
+  (list
+   (make-tq-predicate :key "=" :kind :leaf :signature '((:value-expr :any) (:literal :any))
+     :doc "(= VALUE LIT) — VALUE (a field or (count TRAV)) equals the literal."
+     :compiler (lambda (form)
+                 (let ((getter (%compile-value (second form) "="))
+                       (val (third form)))
+                   (lambda (slug props) (equal (funcall getter slug props) val)))))
+   (make-tq-predicate :key "has" :kind :leaf :signature '((:field-ref :any))
+     :doc "(has FIELD) — FIELD has a non-nil value."
+     :compiler (lambda (form)
+                 (let ((f (second form)))
+                   (lambda (slug props) (and (%field-value f slug props) t)))))
+   (make-tq-predicate :key "matches" :kind :leaf
+     :signature '((:field-ref :text) (:literal :string))
+     :doc "(matches FIELD \"substr\") — FIELD's text contains the substring."
+     :compiler (lambda (form)
+                 (let ((f (second form)) (sub (third form)))
+                   (lambda (slug props)
+                     (let ((v (%field-value f slug props)))
+                       (and (stringp v) (search sub v :test #'char-equal) t))))))
+   (make-tq-predicate :key ">" :kind :leaf
+     :signature '((:value-expr :numeric) (:literal :real))
+     :doc "(> VALUE N) — numeric VALUE is greater than N."
+     :compiler (lambda (form) (%compile-numeric form #'> ">")))
+   (make-tq-predicate :key "<" :kind :leaf
+     :signature '((:value-expr :numeric) (:literal :real))
+     :doc "(< VALUE N) — numeric VALUE is less than N."
+     :compiler (lambda (form) (%compile-numeric form #'< "<")))
+   (make-tq-predicate :key ">=" :kind :leaf
+     :signature '((:value-expr :numeric) (:literal :real))
+     :doc "(>= VALUE N) — numeric VALUE is at least N."
+     :compiler (lambda (form) (%compile-numeric form #'>= ">=")))
+   (make-tq-predicate :key "on" :kind :leaf
+     :signature '((:field-ref :timestamp) (:literal :date))
+     :doc "(on FIELD \"YYYY-MM-DD\") — FIELD falls on the given UTC day."
+     :compiler (%compile-date-pred (lambda (v start end) (and (<= start v) (< v end)))))
+   (make-tq-predicate :key "since" :kind :leaf
+     :signature '((:field-ref :timestamp) (:literal :date))
+     :doc "(since FIELD \"YYYY-MM-DD\") — FIELD is on or after the given UTC day."
+     :compiler (%compile-date-pred (lambda (v start end) (declare (ignore end)) (>= v start))))
+   (make-tq-predicate :key "before" :kind :leaf
+     :signature '((:field-ref :timestamp) (:literal :date))
+     :doc "(before FIELD \"YYYY-MM-DD\") — FIELD is before the given UTC day."
+     :compiler (%compile-date-pred (lambda (v start end) (declare (ignore end)) (< v start))))
+   (make-tq-predicate :key "and" :kind :combinator :signature '(:sub-predicate*)
+     :doc "(and PRED...) — every sub-predicate holds."
+     :compiler (lambda (form)
+                 (let ((ps (mapcar #'interpret-where (cdr form))))
+                   (lambda (slug props) (every (lambda (p) (funcall p slug props)) ps)))))
+   (make-tq-predicate :key "or" :kind :combinator :signature '(:sub-predicate*)
+     :doc "(or PRED...) — some sub-predicate holds."
+     :compiler (lambda (form)
+                 (let ((ps (mapcar #'interpret-where (cdr form))))
+                   (lambda (slug props) (some (lambda (p) (funcall p slug props)) ps)))))
+   (make-tq-predicate :key "not" :kind :combinator :signature '(:sub-predicate)
+     :doc "(not PRED) — the sub-predicate does not hold."
+     :compiler (lambda (form)
+                 (let ((p (interpret-where (second form))))
+                   (lambda (slug props) (not (funcall p slug props))))))
+   (make-tq-predicate :key "all" :kind :quantifier :signature '(:traversal :sub-predicate)
+     :doc "(all TRAV PRED) — every task one TRAV hop away satisfies PRED."
+     :compiler (%compile-quantifier #'every))
+   (make-tq-predicate :key "any" :kind :quantifier :signature '(:traversal :sub-predicate)
+     :doc "(any TRAV PRED) — some task one TRAV hop away satisfies PRED."
+     :compiler (%compile-quantifier #'some))
+   (make-tq-predicate :key "none" :kind :quantifier :signature '(:traversal :sub-predicate)
+     :doc "(none TRAV PRED) — no task one TRAV hop away satisfies PRED."
+     :compiler (%compile-quantifier #'notany)))
+  "The predicate vocabulary: leaf tests, combinators, and quantifiers, each a
+typed registry entry the interpreter dispatches on, the signature validates, and
+reflection renders.")
+
+(defun %find-predicate (name) (find name +tq-predicates+ :key #'tqp-key :test #'string=))
+(defun %predicate-keys () (mapcar #'tqp-key +tq-predicates+))
 
 (defun interpret-where (pred)
-  "Compile a predicate form into a function of (slug props)."
+  "Compile a predicate form into a function of (slug props), dispatching on the
+typed predicate registry. An unknown head is a structured error routed through
+the suggester, never a silent mismatch."
   (unless (consp pred)
     (error 'cairn-query-error
            :message (format nil "A predicate is a form like (= :status \"active\"), got ~S." pred)))
-  (let ((head (%pred-head pred)))
-    (cond
-      ((string= head "=")
-       (let ((getter (%compile-value (second pred) "="))
-             (val (third pred)))
-         (lambda (slug props) (equal (funcall getter slug props) val))))
-      ((string= head "has")
-       (let ((f (second pred)))
-         (%require-field f "has")
-         (lambda (slug props) (and (%field-value f slug props) t))))
-      ((string= head "matches")
-       (let ((f (second pred)) (sub (third pred)))
-         (%require-field f "matches")
-         (unless (stringp sub)
-           (error 'cairn-query-error
-                  :message "(matches FIELD \"substr\") needs a string substring."))
-         (lambda (slug props)
-           (let ((v (%field-value f slug props)))
-             (and (stringp v) (search sub v :test #'char-equal) t)))))
-      ((string= head ">") (%numeric-pred #'> ">" (second pred) (third pred)))
-      ((string= head "<") (%numeric-pred #'< "<" (second pred) (third pred)))
-      ((string= head ">=") (%numeric-pred #'>= ">=" (second pred) (third pred)))
-      ((string= head "and")
-       (let ((ps (mapcar #'interpret-where (cdr pred))))
-         (lambda (slug props) (every (lambda (p) (funcall p slug props)) ps))))
-      ((string= head "or")
-       (let ((ps (mapcar #'interpret-where (cdr pred))))
-         (lambda (slug props) (some (lambda (p) (funcall p slug props)) ps))))
-      ((string= head "not")
-       (let ((p (interpret-where (second pred))))
-         (lambda (slug props) (not (funcall p slug props)))))
-      ((member head '("all" "any" "none") :test #'string=)
-       (unless (= (length pred) 3)
-         (error 'cairn-query-error
-                :message (format nil "(~A TRAV PRED) needs a traversal and a predicate, got ~S." head pred)))
-       (let* ((traverse (%compile-traversal (second pred) (format nil "(~A ...)" head)))
-              (inner (interpret-where (third pred)))
-              (fields (%extract-fields (third pred)))
-              (test (cond ((string= head "all") #'every)
-                          ((string= head "any") #'some)
-                          (t #'notany))))
-         (lambda (slug props)
-           (let ((nodes (%maybe-enrich *query-db*
-                                       (funcall traverse (cons slug props))
-                                       fields)))
-             (funcall test (lambda (n) (funcall inner (car n) (cdr n))) nodes)))))
-      (t (error 'cairn-query-error
-                :message (format nil "Unknown predicate: ~S" pred))))))
+  (let* ((head (%pred-head pred))
+         (desc (and head (%find-predicate head))))
+    (unless desc
+      (error 'cairn-query-error
+             :message (format nil "Unknown predicate ~A; ~A"
+                              (if head head (format nil "~S" pred))
+                              (%suggest (or head "") (%predicate-keys)))))
+    (%check-signature head (cdr pred) (tqp-signature desc))
+    (funcall (tqp-compiler desc) pred)))
 
 ;;; --- Projection / grouping carriers (internal; rendered in the runner) ---
 
 (defstruct (q-projection (:conc-name qp-)) nodes fields)
 (defstruct (q-group (:conc-name qg-)) field groups)
 
-(defun %sort-by (nodes field)
-  "Sort NODES by FIELD, descending. Numeric when the field holds numbers."
+(defun %sort-by (nodes field &optional (direction :desc))
+  "Sort NODES by FIELD. DIRECTION is :desc (default) or :asc. Numeric when the
+field holds numbers, else lexicographic by the field's printed value. FIELD is
+read with %field-value, so :slug (the node's own name) sorts as written."
   (when nodes
-    (let ((numeric (loop for n in nodes
-                         for v = (getf (cdr n) field)
-                         when v return (realp v))))
+    (let* ((numeric (loop for n in nodes
+                          for v = (%field-value field (car n) (cdr n))
+                          when v return (realp v)))
+           (asc (eq direction :asc))
+           (order (if numeric (if asc #'< #'>) (if asc #'string< #'string>))))
       (sort (copy-list nodes)
-            (if numeric #'> #'string>)
+            order
             :key (lambda (n)
-                   (let ((v (getf (cdr n) field)))
+                   (let ((v (%field-value field (car n) (cdr n))))
                      (if numeric (or v 0)
                          (if (stringp v) v (princ-to-string (or v ""))))))))))
 
@@ -581,15 +978,9 @@ edge errors even over an empty input — the edge is a property of the query."
 (defstruct (tq-step (:conc-name tqs-))
   (key nil :read-only t)
   (kind nil :read-only t)
+  (signature nil :read-only t)
   (handler nil :read-only t)
   (doc nil :read-only t))
-
-(defun %field-arg (args op)
-  (let ((f (first args)))
-    (unless (keywordp f)
-      (error 'cairn-query-error
-             :message (format nil "~A needs a field keyword, e.g. (~A :status)." op op)))
-    f))
 
 ;;; --- Mutation steps: writes as composable transformers ---
 ;;
@@ -623,10 +1014,6 @@ PATCH applied to the touched nodes. A node with no task id is left untouched."
 
 (defun %set-status-step (input args)
   (let ((status (first args)))
-    (unless (and (stringp status) (status-valid-p status))
-      (error 'cairn-query-error
-             :message (format nil "(:set-status! STATUS) needs one of ~{~A~^, ~}."
-                              +cairn-statuses+)))
     (%mutate-nodes input
                    (lambda (slug)
                      (%record *query-context* slug "task.update-status"
@@ -649,23 +1036,11 @@ PATCH applied to the touched nodes. A node with no task id is left untouched."
                                 (list :key name :value val)))
                      (lambda (node) (%patch-prop node key val))))))
 
-(defun %mutation-edge-type (arg)
-  "ARG as a lateral edge-type name, mirroring the write tools' enum. A plain
-error here would escape the runner, so an ill-typed edge is a cairn-query-error."
-  (let ((et (and (symbolp arg) (string-downcase (symbol-name arg)))))
-    (cond
-      ((null et)
-       (error 'cairn-query-error
-              :message "An edge mutation needs an edge type, e.g. (:link! :depends-on \"slug\")."))
-      ((member et +cairn-edge-types+ :test #'string=) et)
-      (t (error 'cairn-query-error
-                :message (format nil "Unknown edge type ~A; expected one of ~{~A~^, ~}."
-                                 et +cairn-edge-types+))))))
-
 (defun %edge-step (input args type)
   "Record TYPE (task.link or task.sever) from each task to a constant target. A
-node equal to the target is skipped — a task does not edge to itself."
-  (let ((edge (%mutation-edge-type (first args)))
+node equal to the target is skipped — a task does not edge to itself. The edge
+type is validated against the lateral enum by the step's signature."
+  (let ((edge (string-downcase (symbol-name (first args))))
         (target (%bare-slug (second args))))
     (unless (and (stringp target) (plusp (length target)))
       (error 'cairn-query-error :message "An edge mutation needs a target slug."))
@@ -676,88 +1051,98 @@ node equal to the target is skipped — a task does not edge to itself."
                                 (list :target-id target :edge-type edge))))
                    #'identity)))
 
+(defun %status-enum ()
+  "The status enum as an arg-kind spec: one of the closed status strings."
+  (cons :enum +cairn-statuses+))
+
+(defun %lateral-edge-enum ()
+  "The lateral edge-type enum as an arg-kind spec, written as keywords."
+  (cons :enum (mapcar (lambda (s) (intern (string-upcase s) :keyword))
+                      +cairn-edge-types+)))
+
 (defparameter +tq-steps+
   (list
-   (make-tq-step :key :follow :kind :transformer
+   (make-tq-step :key :follow :kind :transformer :signature '(:edge)
                  :handler (lambda (db input args) (%follow db input (first args)))
                  :doc "(:follow EDGE) — the tasks one EDGE hop forward.")
-   (make-tq-step :key :back :kind :transformer
+   (make-tq-step :key :back :kind :transformer :signature '(:edge)
                  :handler (lambda (db input args) (%back db input (first args)))
                  :doc "(:back EDGE) — the tasks one EDGE hop backward.")
-   (make-tq-step :key :where :kind :transformer
+   (make-tq-step :key :where :kind :transformer :signature '(:sub-predicate)
                  :handler (lambda (db input args)
                             (let ((fn (interpret-where (first args)))
                                   (nodes (%maybe-enrich db input (%extract-fields (first args)))))
                               (remove-if-not (lambda (n) (funcall fn (car n) (cdr n))) nodes)))
                  :doc "(:where PRED) — the tasks satisfying PRED.")
    (make-tq-step :key :sort :kind :transformer
+                 :signature '((:field-ref :any) (:opt (:enum :asc :desc)))
                  :handler (lambda (db input args)
-                            (let ((field (%field-arg args ":sort")))
-                              (%sort-by (%maybe-enrich db input (list field)) field)))
-                 :doc "(:sort FIELD) — descending by FIELD.")
-   (make-tq-step :key :take :kind :transformer
+                            (let ((field (first args))
+                                  (dir (or (second args) :desc)))
+                              (%sort-by (%maybe-enrich db input (list field)) field dir)))
+                 :doc "(:sort FIELD [:asc|:desc]) — order by FIELD; descending by default.")
+   (make-tq-step :key :take :kind :transformer :signature '(:integer)
                  :handler (lambda (db input args)
                             (declare (ignore db))
-                            (let ((n (first args)))
-                              (unless (integerp n)
-                                (error 'cairn-query-error :message "(:take N) needs an integer count."))
-                              (%take input (max 0 n))))
+                            (%take input (max 0 (first args))))
                  :doc "(:take N) — the first N tasks.")
-   (make-tq-step :key :enrich :kind :transformer
+   (make-tq-step :key :enrich :kind :transformer :signature '()
                  :handler (lambda (db input args) (declare (ignore args)) (%enrich db input))
                  :doc "(:enrich) — add counts and promoted metadata.")
-   (make-tq-step :key :union :kind :transformer
+   (make-tq-step :key :union :kind :transformer :signature '(:sub-query)
                  :handler (lambda (db input args) (declare (ignore db))
                             (%union input (%operand-of args ":union")))
                  :doc "(:union Q) — tasks in the pipeline or in sub-query Q.")
-   (make-tq-step :key :intersect :kind :transformer
+   (make-tq-step :key :intersect :kind :transformer :signature '(:sub-query)
                  :handler (lambda (db input args) (declare (ignore db))
                             (%intersect input (%operand-of args ":intersect")))
                  :doc "(:intersect Q) — tasks in both the pipeline and sub-query Q.")
-   (make-tq-step :key :minus :kind :transformer
+   (make-tq-step :key :minus :kind :transformer :signature '(:sub-query)
                  :handler (lambda (db input args) (declare (ignore db))
                             (%minus input (%operand-of args ":minus")))
                  :doc "(:minus Q) — pipeline tasks not in sub-query Q.")
-   (make-tq-step :key :or-else :kind :transformer
+   (make-tq-step :key :or-else :kind :transformer :signature '(:sub-query)
                  :handler (lambda (db input args) (declare (ignore db))
                             (if input input (%operand-of args ":or-else")))
                  :doc "(:or-else Q) — the pipeline if it holds any task, else sub-query Q.")
-   (make-tq-step :key :closure :kind :transformer
+   (make-tq-step :key :closure :kind :transformer :signature '(:edge*)
                  :handler (lambda (db input args) (%closure-step db input args))
                  :doc "(:closure EDGE...) — the forward transitive closure over the EDGEs, cycle-safe.")
-   (make-tq-step :key :select :kind :shaper
+   (make-tq-step :key :select :kind :shaper :signature '(:field-list)
                  :handler (lambda (db input args)
-                            (declare (ignore db))
-                            (unless args
-                              (error 'cairn-query-error :message "(:select FIELD...) needs at least one field."))
-                            (make-q-projection :nodes input :fields args))
+                            (make-q-projection :nodes (%maybe-enrich db input args) :fields args))
                  :doc "(:select FIELD...) — project the named fields.")
-   (make-tq-step :key :group-by :kind :shaper
+   (make-tq-step :key :group-by :kind :shaper :signature '((:field-ref :any))
                  :handler (lambda (db input args)
-                            (let ((field (%field-arg args ":group-by")))
+                            (let ((field (first args)))
                               (%group-by (%maybe-enrich db input (list field)) field)))
                  :doc "(:group-by FIELD) — bucket by FIELD value.")
-   (make-tq-step :key :ids :kind :shaper
+   (make-tq-step :key :ids :kind :shaper :signature '()
                  :handler (lambda (db input args) (declare (ignore db args)) (%slugs input))
                  :doc "(:ids) — the slugs only.")
-   (make-tq-step :key :count :kind :shaper
+   (make-tq-step :key :count :kind :shaper :signature '()
                  :handler (lambda (db input args) (declare (ignore db args)) (length input))
                  :doc "(:count) — the cardinality.")
-   (make-tq-step :key :set-status! :kind :mutation
+   (make-tq-step :key :set-status! :kind :mutation :signature (list (%status-enum))
                  :handler (lambda (db input args) (declare (ignore db)) (%set-status-step input args))
                  :doc "(:set-status! STATUS) — set each task's status; converges on re-run.")
-   (make-tq-step :key :set! :kind :mutation
+   (make-tq-step :key :set! :kind :mutation :signature '((:literal :any) (:literal :any))
                  :handler (lambda (db input args) (declare (ignore db)) (%set-meta-step input args))
                  :doc "(:set! :key \"value\") — set a metadata field on each task.")
    (make-tq-step :key :link! :kind :mutation
+                 :signature (list (%lateral-edge-enum) '(:literal :string))
                  :handler (lambda (db input args) (declare (ignore db)) (%edge-step input args "task.link"))
                  :doc "(:link! :edge \"target\") — add an edge from each task to target.")
    (make-tq-step :key :unlink! :kind :mutation
+                 :signature (list (%lateral-edge-enum) '(:literal :string))
                  :handler (lambda (db input args) (declare (ignore db)) (%edge-step input args "task.sever"))
                  :doc "(:unlink! :edge \"target\") — remove the edge from each task to target."))
-  "The step vocabulary: transformers compose, shapers terminate, mutations write.")
+  "The step vocabulary: transformers compose, shapers terminate, mutations write.
+Each entry carries the machine-readable :signature the one %check-signature
+validates and reflection renders.")
 
 (defun %find-step (key) (find key +tq-steps+ :key #'tqs-key))
+(defun %step-keys () (mapcar (lambda (s) (%field-name (tqs-key s))) +tq-steps+))
 
 (defun interpret-step (result step)
   (unless (%node-set-p result)
@@ -771,11 +1156,16 @@ node equal to the target is skipped — a task does not edge to itself."
       (desc
        (when (and (eq (tqs-kind desc) :mutation) (not *query-allow-mutation*))
          (%refuse-mutation))
+       (%check-signature (%field-display (tqs-key desc)) (cdr step) (tqs-signature desc))
        (funcall (tqs-handler desc) *query-db* result (cdr step)))
       ((and (%mutation-form-p step) (not *query-allow-mutation*))
        (%refuse-mutation))
-      (t (error 'cairn-query-error
-                :message (format nil "Unknown step: ~S" step))))))
+      (t (let ((name (and (symbolp (car step)) (%field-name (car step)))))
+           (error 'cairn-query-error
+                  :message (if name
+                               (format nil "Unknown step ~A; ~A" (%colon name)
+                                       (%suggest name (%step-keys) :display #'%colon))
+                               (format nil "A step is a form like (:follow :phase-of), got ~S." step))))))))
 
 ;;; --- Sources: the typed source table ---
 
@@ -799,12 +1189,27 @@ node equal to the target is skipped — a task does not edge to itself."
   (sort (copy-list nodes) #'string< :key #'car))
 
 (defun %field-nodes ()
-  "The declared field vocabulary: each field a node carrying its :type."
-  (%sort-nodes
-   (mapcar (lambda (ft)
-             (cons (string-downcase (symbol-name (car ft)))
-                   (list :type (string-downcase (symbol-name (cdr ft))))))
-           +field-types+)))
+  "The queryable field vocabulary: each declared field a node of :origin
+\"declared\" carrying its :type, and each live metadata key a node of :origin
+\"metadata\" and :type \"text\". A timestamp field also carries its :unit and
+:epoch, so a date intent is expressible without reverse-engineering the clock. A
+declared name is never re-listed as metadata."
+  (let* ((declared
+           (mapcar (lambda (ft)
+                     (let* ((field (car ft))
+                            (type (string-downcase (symbol-name (cdr ft)))))
+                       (cons (%field-name field)
+                             (append (list :origin "declared" :type type)
+                                     (when (%timestamp-field-p field)
+                                       (list :unit "seconds"
+                                             :epoch "1900-01-01 UTC (CL universal-time)"))))))
+                   +field-types+))
+         (declared-names (mapcar #'car declared))
+         (metadata
+           (loop for key in *query-fields*
+                 unless (member key declared-names :test #'string=)
+                   collect (cons key (list :origin "metadata" :type "text")))))
+    (%sort-nodes (append declared metadata))))
 
 (defun %edge-nodes ()
   "The edge vocabulary, each type carrying the :class %edge-class assigns it: a
@@ -957,24 +1362,37 @@ write head is a structured error, not a silent miss."
                :message (format nil "Unknown write form: ~S" form)))))
 
 (defun %schema-nodes ()
-  "The combinator grammar as a node-set: every source, step, and write form a
-node tagged by :category (and steps by :kind), carrying its :doc. Generated from
-the registries the interpreter dispatches on, so the grammar cannot drift from
-behavior; (schema) lists itself and the other reflective sources."
-  (%sort-nodes
-   (append
-    (mapcar (lambda (s)
-              (cons (tqr-name s) (list :category "source" :doc (tqr-doc s))))
-            +tq-sources+)
-    (mapcar (lambda (s)
-              (cons (string-downcase (symbol-name (tqs-key s)))
-                    (list :category "step"
-                          :kind (string-downcase (symbol-name (tqs-kind s)))
-                          :doc (tqs-doc s))))
-            +tq-steps+)
-    (mapcar (lambda (w)
-              (cons (tqw-name w) (list :category "write" :doc (tqw-doc w))))
-            +tq-write-forms+))))
+  "The combinator grammar as a node-set: every source, step, predicate, and write
+form a node tagged by :category; steps and predicates carry their :kind and the
+machine-readable :signature the one validator checks; each carries its :doc.
+Generated from the registries the interpreter dispatches on, so the grammar
+cannot drift from behavior; (schema) lists itself and the other reflective
+sources."
+  (flet ((sig-prop (signature)
+           (let ((rendered (%render-signature signature)))
+             (unless (string= rendered "") (list :signature rendered)))))
+    (%sort-nodes
+     (append
+      (mapcar (lambda (s)
+                (cons (tqr-name s) (list :category "source" :doc (tqr-doc s))))
+              +tq-sources+)
+      (mapcar (lambda (s)
+                (cons (string-downcase (symbol-name (tqs-key s)))
+                      (append (list :category "step"
+                                    :kind (string-downcase (symbol-name (tqs-kind s))))
+                              (sig-prop (tqs-signature s))
+                              (list :doc (tqs-doc s)))))
+              +tq-steps+)
+      (mapcar (lambda (p)
+                (cons (tqp-key p)
+                      (append (list :category "predicate"
+                                    :kind (string-downcase (symbol-name (tqp-kind p))))
+                              (sig-prop (tqp-signature p))
+                              (list :doc (tqp-doc p)))))
+              +tq-predicates+)
+      (mapcar (lambda (w)
+                (cons (tqw-name w) (list :category "write" :doc (tqw-doc w))))
+              +tq-write-forms+)))))
 
 (defun interpret-expr (form)
   (cond
@@ -993,8 +1411,12 @@ behavior; (schema) lists itself and the other reflective sources."
            ((or (sym= (car form) "union") (sym= (car form) "minus") (sym= (car form) "intersect"))
             (error 'cairn-query-error
                    :message "Set operations are pipeline steps, e.g. (-> (active) (:union (dormant)))."))
-           (t (error 'cairn-query-error
-                     :message (format nil "Unknown source: ~S" form))))))))
+           (t (let ((name (%pred-head form)))
+                (error 'cairn-query-error
+                       :message (if name
+                                    (format nil "Unknown source ~A; ~A" name
+                                            (%suggest name (mapcar #'tqr-name +tq-sources+)))
+                                    (format nil "A query is a source form like (all) or (node \"x\"), got ~S." form))))))))))
 
 (defun interpret-pipeline (forms)
   (let ((result (interpret-expr (first forms))))
@@ -1034,15 +1456,34 @@ behavior; (schema) lists itself and the other reflective sources."
 (defun %format-ids (ids)
   (format nil "~D task~:P:~%~{- ~A~%~}" (length ids) ids))
 
+(defun %iso-date (ut)
+  "Universal-time UT as a YYYY-MM-DD string at UTC (tz 0), so a projected
+timestamp reads as a date without leaving the integer clock behind."
+  (multiple-value-bind (s mi h d m y) (decode-universal-time ut 0)
+    (declare (ignore s mi h))
+    (format nil "~4,'0D-~2,'0D-~2,'0D" y m d)))
+
+(defun %format-field-value (field slug props)
+  "FIELD's projected value as text: a timestamp shows its raw integer and decoded
+UTC date, an absent value the empty-set glyph, anything else its printed value.
+Read with %field-value, so :slug projects the node's own name, not a blank."
+  (let ((v (%field-value field slug props)))
+    (cond
+      ((null v) "∅")
+      ((and (%timestamp-field-p field) (integerp v))
+       (format nil "~D (~A)" v (%iso-date v)))
+      (t (princ-to-string v)))))
+
 (defun %format-projection (proj)
+  "Render every selected field on every row — an absent value as ∅, never a
+dropped column — so the projection is rectangular and a nil is visible."
   (with-output-to-string (s)
     (let ((nodes (qp-nodes proj)) (fields (qp-fields proj)))
       (format s "~D task~:P:~%" (length nodes))
       (dolist (node nodes)
         (format s "- ~A" (car node))
         (dolist (f fields)
-          (let ((v (getf (cdr node) f)))
-            (when v (format s "  ~(~A~)=~A" f v))))
+          (format s "  ~(~A~)=~A" f (%format-field-value f (car node) (cdr node))))
         (terpri s)))))
 
 (defun %format-group (grp)
@@ -1092,7 +1533,8 @@ true, the write context so a `!`-form can record an event."
         (let ((*query-db* (context-db context))
               (*query-current* (current-task-id context))
               (*query-allow-mutation* allow-mutation)
-              (*query-context* (and allow-mutation context)))
+              (*query-context* (and allow-mutation context))
+              (*query-fields* (%metadata-keys (context-db context))))
           (handler-case
               (%text (format-query-result (interpret-query (safe-read-query raw))))
             (cairn-query-parse-error (c)
