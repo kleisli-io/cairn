@@ -9,7 +9,7 @@
 When the session resets, the agent reloads the plan from the graph instead of reconstructing it from the conversation.
 
 <p>
-  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/version-0.1.0-informational.svg"></a>
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/version-0.1.1-informational.svg"></a>
   <a href="https://docs.kleisli.io/cairn"><img alt="Docs" src="https://img.shields.io/badge/docs-docs.kleisli.io-blue.svg"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg"></a>
   <img alt="MCP compatible" src="https://img.shields.io/badge/MCP-compatible-2ea44f.svg">
@@ -71,10 +71,10 @@ programs.kli = {
 };
 ```
 
-Imperatively, install a published release with the `kli install` subcommand. Every [release page](https://github.com/kleisli-io/cairn/releases) carries the exact command for that version; for v0.1.0:
+Imperatively, install a published release with the `kli install` subcommand. Every [release page](https://github.com/kleisli-io/cairn/releases) carries the exact command for that version; for v0.1.1:
 
 ```sh
-kli install https://github.com/kleisli-io/cairn/releases/download/v0.1.0/cairn.bundle f97b592316027ef9c8c56d2072a75b6b596a0172
+kli install https://github.com/kleisli-io/cairn/releases/download/v0.1.1/cairn.bundle 1b92b2928de8de87711c299d7353f1e0b602068e
 ```
 
 The second argument is the release's git-tree-sha1 pin: kli recomputes it over the fetched tree and refuses to install on a mismatch. It shows what it is about to add and asks before going ahead; pass `--yes` for scripts and other non-interactive use. To additionally require the release signature, add the Kleisli.IO release key — committed at [`release/trust/cairn-release.pub`](https://github.com/kleisli-io/cairn/blob/main/release/trust/cairn-release.pub) — to `trustRoots` in your kli `settings.json`; kli then fetches `cairn.bundle.sig` next to the artifact and installs only if the signature verifies.

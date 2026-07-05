@@ -2,9 +2,11 @@
 # Clean-image witness: a kli binary that does not bundle cairn installs cairn's
 # real source over a loopback origin, then a fresh `kli mcp-serve cairn` process
 # loads the placed directory unit through ASDF in cairn.asd's declared order and
-# serves its tools. cairn.asd is :serial with store before model, so serving at
-# all proves the declared order was honored; creating a task, observing it, and
-# searching it back exercises the store's FTS5 in the live libsqlite.
+# serves its tools, prompts, and resources. cairn.asd is :serial with store
+# before model, so serving at all proves the declared order was honored;
+# creating a task, observing it, and searching it back exercises the store's
+# FTS5 in the live libsqlite; the prompt surface proves the resources.sexp
+# manifest resolves the bundled templates from the placed tree.
 import argparse
 import base64
 import json
@@ -20,8 +22,10 @@ def read_bytes(path):
         return f.read()
 
 
-def cairn_tree(asd, version, src):
+def cairn_tree(asd, version, src, resources=None):
     files = {"cairn.asd": read_bytes(asd), "version.sexp": read_bytes(version)}
+    if resources:
+        files["resources.sexp"] = read_bytes(resources)
     for dirpath, _dirs, names in os.walk(src):
         for name in names:
             path = os.path.join(dirpath, name)
@@ -136,6 +140,12 @@ class McpServer:
     def tools(self):
         return [t["name"] for t in self._rpc("tools/list")["tools"]]
 
+    def prompts(self):
+        return [p["name"] for p in self._rpc("prompts/list")["prompts"]]
+
+    def resource_uris(self):
+        return [r["uri"] for r in self._rpc("resources/list")["resources"]]
+
     def call(self, name, arguments):
         result = self._rpc("tools/call", {"name": name, "arguments": arguments})
         text = "\n".join(b.get("text", "") for b in result.get("content", []) or []
@@ -160,10 +170,11 @@ def main():
     ap.add_argument("--kli", required=True)
     ap.add_argument("--asd", required=True)
     ap.add_argument("--version", required=True)
+    ap.add_argument("--resources")
     ap.add_argument("--src", required=True)
     args = ap.parse_args()
 
-    files = cairn_tree(args.asd, args.version, args.src)
+    files = cairn_tree(args.asd, args.version, args.src, args.resources)
     origin = Origin(bundle_bytes(files))
     sha = git_tree_sha(files)
 
@@ -191,6 +202,14 @@ def main():
                 for want in ("task_create", "observe", "task_search"):
                     assert want in names, \
                         f"missing tool {want} in {names}\n{server.stderr()}"
+                prompt_names = server.prompts()
+                for want in ("workon", "handoff", "implement",
+                             "plan", "research", "validate"):
+                    assert want in prompt_names, \
+                        f"missing prompt {want} in {prompt_names}\n{server.stderr()}"
+                uris = server.resource_uris()
+                assert "cairn://prompts/workon" in uris, \
+                    f"missing prompt resource in {uris}\n{server.stderr()}"
                 server.call("task_create", {"name": "e2e-witness"})
                 server.call("observe", {"text": "cross-process witness marker zeta"})
                 hit = server.call("task_search", {"query": "zeta"})
@@ -200,7 +219,8 @@ def main():
                 server.close()
         finally:
             origin.stop()
-    print("ok: cairn installs, loads via ASDF in declared order, serves (FTS5 live)")
+    print("ok: cairn installs, loads via ASDF in declared order, "
+          "serves tools + prompts + resources (FTS5 live)")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build cairn's release artifact into --out: cairn.bundle (kli-dir-bundle-v1
-envelope over {cairn.asd, version.sexp, src/**}) and pin (its git write-tree id,
-the install integrity floor). Sorted entries/keys make the bytes a pure function
-of the source; the bundle is parsed back to confirm it round-trips to the pin."""
+envelope over {cairn.asd, version.sexp, resources.sexp, src/**}) and pin (its
+git write-tree id, the install integrity floor). Sorted entries/keys make the
+bytes a pure function of the source; the bundle is parsed back to confirm it
+round-trips to the pin."""
 import argparse
 import base64
 import json
@@ -16,8 +17,10 @@ def read_bytes(path):
         return f.read()
 
 
-def collect(asd, version, src):
+def collect(asd, version, src, resources=None):
     files = {"cairn.asd": read_bytes(asd), "version.sexp": read_bytes(version)}
+    if resources:
+        files["resources.sexp"] = read_bytes(resources)
     for dirpath, _dirs, names in os.walk(src):
         for name in names:
             path = os.path.join(dirpath, name)
@@ -66,11 +69,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--asd", required=True)
     ap.add_argument("--version", required=True)
+    ap.add_argument("--resources")
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    files = collect(args.asd, args.version, args.src)
+    files = collect(args.asd, args.version, args.src, args.resources)
     envelope = bundle_bytes(files)
     pin = git_tree_sha(files)
 

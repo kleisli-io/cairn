@@ -52,6 +52,23 @@ let
     "kli/cairn/prompts" = ./src/prompts;
   };
 
+  # A source distribution cannot run the resource registrations the compiled
+  # build bakes into its fasls, so the bundle carries this generated manifest
+  # instead and the host registers each key against the placed tree. Generated
+  # from resourcesAttr so the two never drift.
+  resourceManifest =
+    let
+      rootStr = toString ./.;
+      entries = lib.mapAttrsToList
+        (key: dir:
+          ''("${key}" . "${lib.removePrefix (rootStr + "/") (toString dir)}/")'')
+        resourcesAttr;
+    in
+    pkgs.writeText "resources.sexp" ''
+      ;;;; Bundled resource roots -- GENERATED; do not hand-edit.
+      (${lib.concatStringsSep "\n " entries})
+    '';
+
   # cairn.asd generated from srcs (drift-checked) so the ASDF loader and the Nix
   # build share one load order. No :depends-on: kli and sqlite are already in the
   # host image when it loads cairn as a directory unit.
@@ -97,8 +114,9 @@ let
   # Clean-image witness: the relocatable kli bundle (which does not bundle cairn
   # but carries libsqlite in its lib/) installs cairn's real source over a
   # loopback origin, then a fresh `kli mcp-serve cairn` loads the placed directory
-  # unit via ASDF in declared order and serves its tools, opening the store
-  # against the bundled libsqlite so FTS5 is exercised at runtime.
+  # unit via ASDF in declared order and serves its tools, prompts, and resources
+  # (the prompt templates resolving through the resources.sexp manifest), opening
+  # the store against the bundled libsqlite so FTS5 is exercised at runtime.
   serveE2E = pkgs.runCommand "cairn-serve-e2e"
     { nativeBuildInputs = [ pkgs.python3 pkgs.git ]; } ''
     export HOME="$TMPDIR/home"
@@ -107,6 +125,7 @@ let
       --kli ${kli.kliRelocatable}/bin/kli \
       --asd ${./cairn.asd} \
       --version ${./version.sexp} \
+      --resources ${resourceManifest} \
       --src ${./src}
     touch $out
   '';
@@ -131,6 +150,7 @@ let
     build() {
       python3 ${./release/bundle.py} \
         --asd ${./cairn.asd} --version ${./version.sexp} \
+        --resources ${resourceManifest} \
         --src ${bundleSrc} --out "$1"
     }
     build "$out"

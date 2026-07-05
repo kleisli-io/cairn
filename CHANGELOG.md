@@ -4,6 +4,12 @@ All notable changes to cairn are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-05
+
+### Fixed
+
+- The release bundle now carries a generated `resources.sexp` manifest mapping the bundled prompt directory to its place in the bundle, so a source install serves the workflow prompts — `workon`, `handoff`, `implement`, `plan`, `research`, `validate` — over MCP `prompts/list` and `resources/list`. Requires kli ≥ 0.1.3, which registers the manifest's roots at load; on older kli the prompts remain unavailable (tools are unaffected either way).
+
 ## [0.1.0] - 2026-07-04
 
 First public release of cairn — a durable task graph your agent plans in and resumes into. When a session resets, the agent reloads the plan from the graph instead of reconstructing it from the conversation: open phases, dependencies, status, and the reasoning behind each decision are all still there. cairn ships as a [kli](https://github.com/kleisli-io/kli) extension and serves to any MCP client — Claude Code, Claude Desktop, Cursor — with a single `kli mcp-serve cairn`.
