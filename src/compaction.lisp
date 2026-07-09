@@ -33,6 +33,22 @@ per-protocol in memory; never a durable write."
                   when (integerp ts) maximize ts)))
     (and (integerp hi) (plusp hi) hi)))
 
+(defun %committed-compaction-watermark (agent-context slug)
+  "Newest committed cairn fold boundary for SLUG in AGENT-CONTEXT's branch."
+  (ignore-errors
+    (let ((store (agent-context-store agent-context))
+          (session (agent-context-session agent-context))
+          (leaf-id (agent-context-leaf-id agent-context)))
+      (when (and store session leaf-id)
+        (loop for entry in (session-branch store session leaf-id)
+              when (typep entry 'compaction-entry)
+                maximize
+                (let ((folded (getf (entry-data entry) :cairn-folded)))
+                  (if (and (equal slug (getf folded :task-id))
+                           (integerp (getf folded :ts-hi)))
+                      (getf folded :ts-hi)
+                      0)))))))
+
 (defun render-compaction-cairns (db slug ts-lo ts-hi
                                  &key (budget *cairn-compaction-budget-chars*))
   "A char-budgeted block of SLUG's observations and handoffs whose timestamp
@@ -69,25 +85,25 @@ no cairns. Read-only."
          (mapcar #'first obs)
          (mapcar #'first handoffs)))))
 
-(defun cairn-compaction-block (context messages)
+(defun cairn-compaction-block (context messages &key agent-context)
   "The cairn block and fold details for the dropped span MESSAGES under CONTEXT's
-current task, or (values nil nil) when there is nothing to fold. Advances the
-per-task watermark. Read-only against the store."
+current task, or (values nil nil) when there is nothing to fold. Read-only
+against the store."
   (let ((db (cairn-db (active-protocol context)))
         (slug (current-task-id context)))
     (when (and db slug)
       (with-cairn-store-lock (context)
         (let ((ts-hi (%span-upper-bound messages)))
           (when ts-hi
-            (let ((ts-lo (or (%compaction-watermark context slug) 0)))
+            (let ((ts-lo (or (%committed-compaction-watermark agent-context slug)
+                             (%compaction-watermark context slug)
+                             0)))
               (multiple-value-bind (text obs-ids handoff-ids)
                   (render-compaction-cairns db slug ts-lo ts-hi)
-                ;; Anchor the next cut's lower bound on this boundary, closing the
-                ;; gap left by messages kept past a prior cut. Advances whether or
-                ;; not the span held cairns; an aborted compaction leaves it
-                ;; advanced, at worst omitting still-durable cairns from a later
-                ;; summary.
-                (setf (%compaction-watermark context slug) ts-hi)
+                ;; Without a live session branch, fall back to a process-local
+                ;; boundary.
+                (unless agent-context
+                  (setf (%compaction-watermark context slug) ts-hi))
                 (when text
                   (values text
                           (list :cairn-folded
@@ -110,7 +126,10 @@ block. No-op (returns NIL) when no agent-session service is present."
          (lambda (&rest args)
            (multiple-value-bind (summary prior-details) (apply previous args)
              (multiple-value-bind (block details)
-                 (ignore-errors (cairn-compaction-block context (getf args :messages)))
+                 (ignore-errors
+                   (cairn-compaction-block context (getf args :messages)
+                                           :agent-context
+                                           (getf args :agent-context)))
                (cond
                  ((null block) (values summary prior-details))
                  ((and (stringp summary) (plusp (length summary)))

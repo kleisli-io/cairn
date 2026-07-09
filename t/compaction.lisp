@@ -174,6 +174,30 @@ dropped span's earliest message) and never re-folds the first cut's cairn."
         (is (search "second-cut cairn" cut2) "the second span's cairn is folded")
         (is (null (search "first-cut cairn" cut2)) "the first cut's cairn is not re-folded")))))
 
+(test agent-context-mode-does-not-advance-watermark-before-commit
+  "KLI can retry a compaction before committing the first summarizer result; the
+retry must still fold cairns from the earlier pre-commit span."
+  (with-cairn-compaction-protocol (context protocol cairn service)
+    (declare (ignore cairn service))
+    (ext:invoke-tool protocol :task_create (list :name "the retry task") context)
+    (let ((slug (cairn:current-task-id context))
+          (db (task-db protocol)))
+      (seed-observation db slug "first attempt cairn" (+ +ct0+ 50))
+      (seed-observation db slug "retry attempt cairn" (+ +ct0+ 100))
+      (cairn::cairn-compaction-block
+       context (stub-messages (+ +ct0+ 60))
+       :agent-context :pre-commit-retry)
+      (multiple-value-bind (retry-summary details)
+          (cairn::cairn-compaction-block
+           context (stub-messages (+ +ct0+ 120))
+           :agent-context :pre-commit-retry)
+        (is (search "first attempt cairn" retry-summary)
+            "the first attempt's cairn is still folded on retry")
+        (is (search "retry attempt cairn" retry-summary)
+            "the retry span's cairn is folded")
+        (is (= 2 (length (getf (getf details :cairn-folded) :observations)))
+            "both folded ids are recorded in the committed candidate")))))
+
 (test summarizing-does-not-write-the-store
   "A summarize is read-only: the event and projection rows are unchanged."
   (with-cairn-compaction-protocol (context protocol cairn service)

@@ -32,9 +32,16 @@
                 #:recode-context-transform-policy
                 #:session-compaction-policy
                 #:recode-compaction-policy)
+  (:import-from #:kli/context/lens
+                #:agent-context-session
+                #:agent-context-store
+                #:agent-context-leaf-id)
   (:import-from #:kli/session/log
+                #:compaction-entry
+                #:entry-data
                 #:make-harness-context-message
-                #:message-timestamp)
+                #:message-timestamp
+                #:session-branch)
   (:import-from #:kli/interaction/commands
                 #:make-command
                 #:make-command-result
